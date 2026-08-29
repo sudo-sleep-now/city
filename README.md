@@ -60,18 +60,6 @@ Open <http://localhost:3000>, click **Enter Solheim** and walk around.
 | `bun run start` | Run the standalone production server |
 | `bun run build:static` | Static export for GitHub Pages (`NEXT_EXPORT=1`) |
 
-## Deploying to GitHub Pages
-
-This repository ships with a GitHub Actions workflow (`.github/workflows/deploy.yml`) that lints, builds a static export and publishes the site to GitHub Pages on every push to `main`.
-
-1. Push this repository to GitHub.
-2. In the repository settings, go to **Pages** and set **Source → GitHub Actions**.
-3. The site goes live at `https://<user>.github.io/<repository-name>/`.
-
-The workflow automatically sets the Next.js `basePath` to the repository name, so the app works from a project sub-path. For a custom domain (served from the site root), remove the `NEXT_PUBLIC_BASE_PATH` environment variable from the workflow. The app is fully client-side, so no server is required.
-
-A traditional Node deployment also works: `bun run build && bun run start` (standalone server), or deploy to any platform that hosts Next.js.
-
 ## Project structure
 
 ```
