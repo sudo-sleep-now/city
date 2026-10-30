@@ -40,6 +40,10 @@ export class LightingRig {
   private clock = 9.5 // hours
   private skyMat: THREE.ShaderMaterial
   private sunMesh: THREE.Mesh
+  private shadowRight = new THREE.Vector3()
+  private shadowUp = new THREE.Vector3()
+  private shadowCenter = new THREE.Vector3()
+  viewDistance = 1600
 
   constructor(scene: THREE.Scene) {
     this.scene = scene
@@ -133,8 +137,20 @@ export class LightingRig {
     const dayness = Math.max(0, Math.min(1, Math.sin(ang) * 1.6)) // 0 night, 1 noon
     const dusk = Math.max(0, 1 - Math.abs(Math.sin(ang)) * 2.2) // sunrise/sunset factor
 
-    this.sun.position.copy(playerPos).addScaledVector(sunDir, 260)
-    this.sun.target.position.copy(playerPos)
+    // Snap the moving shadow frustum in light space. Following the camera at
+    // sub-texel increments makes shadow edges crawl across otherwise stable
+    // road and facade surfaces, especially at shallow viewing angles.
+    this.shadowRight.set(sunDir.z, 0, -sunDir.x).normalize()
+    this.shadowUp.crossVectors(sunDir, this.shadowRight).normalize()
+    this.shadowCenter.copy(playerPos)
+    const shadowCamera = this.sun.shadow.camera
+    const texelX = (shadowCamera.right - shadowCamera.left) / this.sun.shadow.mapSize.x
+    const texelY = (shadowCamera.top - shadowCamera.bottom) / this.sun.shadow.mapSize.y
+    const x = playerPos.dot(this.shadowRight), y = playerPos.dot(this.shadowUp)
+    this.shadowCenter.addScaledVector(this.shadowRight, Math.round(x / texelX) * texelX - x)
+    this.shadowCenter.addScaledVector(this.shadowUp, Math.round(y / texelY) * texelY - y)
+    this.sun.position.copy(this.shadowCenter).addScaledVector(sunDir, 260)
+    this.sun.target.position.copy(this.shadowCenter)
     this.sun.intensity = 2.6 * dayness
     this.sun.color.setHSL(0.09 + 0.04 * dayness, 0.5 - 0.35 * dayness + 0.3 * dusk, 0.55 + 0.1 * dayness)
 
@@ -164,6 +180,13 @@ export class LightingRig {
     this.sceneFog.color.copy(horizon).lerp(top, 0.25)
     this.sceneFog.near = 200 + dayness * 100
     this.sceneFog.far = 700 + dayness * 500
+    this.limitFogDistance()
+  }
+
+  /** Fully fade geometry before distance culling removes its neighbourhood. */
+  limitFogDistance() {
+    this.sceneFog.far = Math.min(this.sceneFog.far, this.viewDistance)
+    this.sceneFog.near = Math.min(this.sceneFog.near, this.sceneFog.far * .45)
   }
 
   /** 0 at noon → 1 at deep night, for streetlight/window emissive. */

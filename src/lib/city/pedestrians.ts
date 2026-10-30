@@ -653,7 +653,7 @@ export class PedestrianSystem {
                 ped.stopId = spot.stopId
                 ped.spotRy = spot.ry
                 // stand beside the shelter bench, facing the road
-                this.goTo(ped, spot.x + Math.sin(spot.ry) * -0.5, spot.z + Math.cos(spot.ry) * -0.5, 'shelter')
+                this.goTo(ped, spot.x + Math.sin(spot.ry) * 0.5, spot.z + Math.cos(spot.ry) * 0.5, 'shelter')
                 went = true
               }
             }

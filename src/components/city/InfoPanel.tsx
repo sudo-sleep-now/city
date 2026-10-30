@@ -36,7 +36,7 @@ export default function InfoPanel() {
         </div>
 
         <div className="mt-6 text-[11px] text-emerald-200/40 leading-relaxed">
-          Every placement in Solheim answers a “why”. Walk on — or press <b className="text-emerald-300">E</b> to keep exploring.
+          This is an illustrative district proposal. Features and policy ambitions need funding, consultation and testing. Press <b className="text-emerald-300">E</b> to keep exploring.
         </div>
       </div>
     </div>

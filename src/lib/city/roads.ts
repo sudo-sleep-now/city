@@ -1,9 +1,10 @@
 import * as THREE from 'three'
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js'
 import { worldUVPlane, worldUVBox } from './materials'
-import { GRID_LINES, LANE_OFFSET, ROAD_WIDTH, SIDEWALK_WIDTH, SPEED_LIMIT } from './constants'
+import { GRID_LINES, LANE_OFFSET, SIDEWALK_WIDTH, SPEED_LIMIT } from './constants'
 import { roadHalfWidth } from './planner'
-import type { CityMaterials, CityPlan, ConnPath, CrosswalkSeg, LaneSeg, RoadClass, RoadNetworkData, SidewalkSeg, SignalGroup } from './types'
+import { redesignCrossroads } from './junctions'
+import type { CityMaterials, CityPlan, ConnPath, CrosswalkSeg, CrosswalkSpec, LaneSeg, RoadClass, RoadNetworkData, SidewalkSeg, SignalGroup } from './types'
 
 /* ============================================================
  * Road network: directed lane graph (right-hand traffic) with
@@ -20,7 +21,7 @@ function mulberry32(seed: number) {
   }
 }
 
-export function buildRoadNetwork(plan: CityPlan): RoadNetworkData {
+export function buildRoadNetwork(plan: CityPlan, options: { turnPockets?: boolean } = {}): RoadNetworkData {
   const lanes = new Map<string, LaneSeg>()
   const sidewalks = new Map<string, SidewalkSeg>()
   const crosswalks: CrosswalkSeg[] = []
@@ -48,7 +49,7 @@ export function buildRoadNetwork(plan: CityPlan): RoadNetworkData {
   }
 
   for (const road of plan.roads) {
-    if (road.pedestrianOnly) continue
+    if (road.pedestrianOnly || road.transitOnly) continue
     // iterate grid lines within [from,to]
     const lines = GRID_LINES.filter((l) => l > road.from + 1 && l < road.to - 1)
     const bounds = [road.from, ...lines, road.to]
@@ -58,8 +59,13 @@ export function buildRoadNetwork(plan: CityPlan): RoadNetworkData {
       if (b2 - a < 4) continue
       // pull the piece ends back to the edge of every crossing roadway so
       // vehicles cross the intersection on a connector path (straight or arc)
-      const aCross = i > 0
-      const bCross = i < bounds.length - 2
+      // A fragmented road can start/end at an existing junction too. Leaving
+      // that endpoint at the road centre puts its queue in crossing traffic.
+      const hasCrossing = (at: number) => plan.roads.some(other => other.axis !== road.axis
+        && !other.pedestrianOnly && !other.transitOnly && Math.abs(other.coord - at) < 0.1
+        && road.coord >= other.from && road.coord <= other.to)
+      const aCross = i > 0 || hasCrossing(a)
+      const bCross = i < bounds.length - 2 || hasCrossing(b2)
       const ta = aCross ? a + roadHalfWidth(lineClsOf(a), a) + 1.2 : a
       const tb = bCross ? b2 - roadHalfWidth(lineClsOf(b2), b2) - 1.2 : b2
       if (tb - ta < 3) continue
@@ -68,14 +74,14 @@ export function buildRoadNetwork(plan: CityPlan): RoadNetworkData {
       // eastbound/southbound lane on positive offset side, opposite on negative
       if (road.axis === 'x') {
         // eastbound (+X) at z = coord + laneOff
-        pieces.push({ id: `Lx${road.coord}e${i}`, axis: 'x', dir: 1, coord: road.coord + laneOff, baseCoord: road.coord, from: ta, to: tb, cls: road.cls })
+        pieces.push({ id: `Lx${road.coord}e${i}:${road.id}`, axis: 'x', dir: 1, coord: road.coord + laneOff, baseCoord: road.coord, from: ta, to: tb, cls: road.cls })
         // westbound (−X) at z = coord − laneOff
-        pieces.push({ id: `Lx${road.coord}w${i}`, axis: 'x', dir: -1, coord: road.coord - laneOff, baseCoord: road.coord, from: ta, to: tb, cls: road.cls })
+        pieces.push({ id: `Lx${road.coord}w${i}:${road.id}`, axis: 'x', dir: -1, coord: road.coord - laneOff, baseCoord: road.coord, from: ta, to: tb, cls: road.cls })
       } else {
         // southbound (+Z) at x = coord − laneOff
-        pieces.push({ id: `Lz${road.coord}s${i}`, axis: 'z', dir: 1, coord: road.coord - laneOff, baseCoord: road.coord, from: ta, to: tb, cls: road.cls })
+        pieces.push({ id: `Lz${road.coord}s${i}:${road.id}`, axis: 'z', dir: 1, coord: road.coord - laneOff, baseCoord: road.coord, from: ta, to: tb, cls: road.cls })
         // northbound (−Z) at x = coord + laneOff
-        pieces.push({ id: `Lz${road.coord}n${i}`, axis: 'z', dir: -1, coord: road.coord + laneOff, baseCoord: road.coord, from: ta, to: tb, cls: road.cls })
+        pieces.push({ id: `Lz${road.coord}n${i}:${road.id}`, axis: 'z', dir: -1, coord: road.coord + laneOff, baseCoord: road.coord, from: ta, to: tb, cls: road.cls })
       }
     }
   }
@@ -84,10 +90,10 @@ export function buildRoadNetwork(plan: CityPlan): RoadNetworkData {
   for (const p of pieces) {
     const seg: LaneSeg = {
       id: p.id,
-      x1: p.axis === 'x' ? p.from : p.coord,
-      z1: p.axis === 'x' ? p.coord : p.from,
-      x2: p.axis === 'x' ? p.to : p.coord,
-      z2: p.axis === 'x' ? p.coord : p.to,
+      x1: p.axis === 'x' ? (p.dir === 1 ? p.from : p.to) : p.coord,
+      z1: p.axis === 'x' ? p.coord : (p.dir === 1 ? p.from : p.to),
+      x2: p.axis === 'x' ? (p.dir === 1 ? p.to : p.from) : p.coord,
+      z2: p.axis === 'x' ? p.coord : (p.dir === 1 ? p.to : p.from),
       cls: p.cls,
       speed: SPEED_LIMIT[p.cls],
       next: [],
@@ -95,8 +101,8 @@ export function buildRoadNetwork(plan: CityPlan): RoadNetworkData {
     lanes.set(p.id, seg)
   }
   // intersection node = (x of the crossing z-road, z of the crossing x-road)
-  const endNode = (p: Piece) => (p.axis === 'x' ? `${nearestGrid(p.to)}_${p.baseCoord}` : `${p.baseCoord}_${nearestGrid(p.to)}`)
-  const startNode = (p: Piece) => (p.axis === 'x' ? `${nearestGrid(p.from)}_${p.baseCoord}` : `${p.baseCoord}_${nearestGrid(p.from)}`)
+  const endNode = (p: Piece) => (p.axis === 'x' ? `${nearestGrid(p.dir === 1 ? p.to : p.from)}_${p.baseCoord}` : `${p.baseCoord}_${nearestGrid(p.dir === 1 ? p.to : p.from)}`)
+  const startNode = (p: Piece) => (p.axis === 'x' ? `${nearestGrid(p.dir === 1 ? p.from : p.to)}_${p.baseCoord}` : `${p.baseCoord}_${nearestGrid(p.dir === 1 ? p.from : p.to)}`)
 
   const startsAt = new Map<string, Piece[]>()
   for (const p of pieces) {
@@ -113,48 +119,15 @@ export function buildRoadNetwork(plan: CityPlan): RoadNetworkData {
       // no U-turn: same road, opposite direction
       if (q.axis === p.axis && q.baseCoord === p.baseCoord && q.dir !== p.dir) continue
       seg.next.push(q.id)
-      // build the connector path across the intersection
-      const p1 = { x: seg.x2, z: seg.z2 }
-      const qSeg = lanes.get(q.id)!
-      const p2 = { x: qSeg.x1, z: qSeg.z1 }
-      const d0 = { x: p.axis === 'x' ? p.dir : 0, z: p.axis === 'x' ? 0 : p.dir }
-      const d1 = { x: q.axis === 'x' ? q.dir : 0, z: q.axis === 'x' ? 0 : q.dir }
-      const dot = d0.x * d1.x + d0.z * d1.z
-      const straight = dot > 0.9
-      let pts: { x: number; z: number }[]
-      if (straight) {
-        pts = [p1, p2]
-      } else {
-        // cubic Bezier: out of p1 along d0, into p2 against d1
-        const span = Math.hypot(p2.x - p1.x, p2.z - p1.z)
-        const k = Math.min(9.5, Math.max(4, span * 0.45))
-        const c0 = { x: p1.x + d0.x * k, z: p1.z + d0.z * k }
-        const c1 = { x: p2.x - d1.x * k, z: p2.z - d1.z * k }
-        pts = []
-        const N = 9
-        for (let s = 0; s <= N; s++) {
-          const t = s / N
-          const u = 1 - t
-          pts.push({
-            x: u * u * u * p1.x + 3 * u * u * t * c0.x + 3 * u * t * t * c1.x + t * t * t * p2.x,
-            z: u * u * u * p1.z + 3 * u * u * t * c0.z + 3 * u * t * t * c1.z + t * t * t * p2.z,
-          })
-        }
-      }
-      const cum: number[] = [0]
-      let total = 0
-      for (let s = 1; s < pts.length; s++) {
-        total += Math.hypot(pts[s].x - pts[s - 1].x, pts[s].z - pts[s - 1].z)
-        cum.push(total)
-      }
-      connectors.set(`${p.id}>${q.id}`, { pts, cum, len: total, straight })
     }
   }
+  redesignCrossroads(plan, lanes, connectors, options.turnPockets !== false)
   void rng
 
   /* ---------------- sidewalks ---------------- */
   const spieces: { id: string; axis: 'x' | 'z'; coord: number; from: number; to: number; cls: RoadClass }[] = []
   for (const road of plan.roads) {
+    if (road.transitOnly) continue
     const hw = roadHalfWidth(road.cls, road.coord)
     const off = hw + SIDEWALK_WIDTH[road.cls] / 2
     const lines = GRID_LINES.filter((l) => l > road.from + 1 && l < road.to - 1)
@@ -225,16 +198,17 @@ export function buildRoadNetwork(plan: CityPlan): RoadNetworkData {
   /* ---------------- crosswalks ---------------- */
   for (const cw of plan.crosswalks) {
     const laneIds: string[] = []
+    const crossedHalf = roadHalfWidth(cw.roadCls, cw.axis === 'x' ? cw.x : cw.z)
     for (const seg of lanes.values()) {
       if (cw.axis === 'x') {
         // ped walks along x → crossing a road that runs along z → lane is axis z
-        if (Math.abs(seg.x1 - seg.x2) < 0.5 && Math.abs(seg.x1 - cw.x) < 3.5) {
+        if (Math.abs(seg.x1 - seg.x2) < 0.5 && Math.abs(seg.x1 - cw.x) < crossedHalf + 0.5) {
           const lo = Math.min(seg.z1, seg.z2)
           const hi = Math.max(seg.z1, seg.z2)
           if (cw.z > lo - 4 && cw.z < hi + 4) laneIds.push(seg.id)
         }
       } else {
-        if (Math.abs(seg.z1 - seg.z2) < 0.5 && Math.abs(seg.z1 - cw.z) < 3.5) {
+        if (Math.abs(seg.z1 - seg.z2) < 0.5 && Math.abs(seg.z1 - cw.z) < crossedHalf + 0.5) {
           const lo = Math.min(seg.x1, seg.x2)
           const hi = Math.max(seg.x1, seg.x2)
           if (cw.x > lo - 4 && cw.x < hi + 4) laneIds.push(seg.id)
@@ -246,7 +220,7 @@ export function buildRoadNetwork(plan: CityPlan): RoadNetworkData {
     // their span must cover the crossing coordinate. (The old nearest-endpoint
     // heuristic matched corner pieces of the perpendicular street, which made
     // peds "cross" in 0.3 m and never wait at signals.)
-    const crossedRoadHalf = roadHalfWidth(cw.roadCls === 'arterial' ? 'arterial' : cw.roadCls, cw.axis === 'x' ? cw.z : cw.x)
+    const crossedRoadHalf = crossedHalf
     let a = ''
     let b = ''
     let bestA = Infinity
@@ -281,7 +255,7 @@ export function buildRoadNetwork(plan: CityPlan): RoadNetworkData {
       const d = Math.hypot(tl.x - cw.x, tl.z - cw.z)
       if (d < bestS) { bestS = d; signalId = tl.id }
     }
-    crosswalks.push({ id: `cw${cw.x}_${cw.z}_${cw.axis}`, x: cw.x, z: cw.z, axis: cw.axis, width: 16, a, b, laneIds, signalId })
+    crosswalks.push({ id: `cw${cw.x}_${cw.z}_${cw.axis}`, x: cw.x, z: cw.z, axis: cw.axis, width: crossedHalf * 2, a, b, laneIds, signalId })
   }
 
   /* ---------------- signals ---------------- */
@@ -294,9 +268,14 @@ export function buildRoadNetwork(plan: CityPlan): RoadNetworkData {
       { x: tl.x + 12.5, z: tl.z - 12.5, axis: 'z' as const, dir: 1 as const },
       { x: tl.x - 12.5, z: tl.z + 12.5, axis: 'z' as const, dir: -1 as const },
     ]
-    const phases = tl.phase0Axis === 'x'
+    const axes = tl.phase0Axis === 'x'
       ? [{ greenAxis: 'x' as const, duration: 9 }, { greenAxis: 'z' as const, duration: 9 }]
       : [{ greenAxis: 'z' as const, duration: 9 }, { greenAxis: 'x' as const, duration: 9 }]
+    const phases = axes.flatMap(phase => {
+      const hasPocket = [...lanes.values()].some(lane => lane.signalId === tl.id && lane.pocket === 'left'
+        && (Math.abs(lane.x2 - lane.x1) > Math.abs(lane.z2 - lane.z1) ? 'x' : 'z') === phase.greenAxis)
+      return hasPocket ? [{ ...phase, movement: 'through' as const }, { greenAxis: phase.greenAxis, duration: 6, movement: 'left' as const }] : [phase]
+    })
     signals.push({ id: tl.id, x: tl.x, z: tl.z, phases, heads })
   }
 
@@ -324,9 +303,25 @@ function plate(axis: 'x' | 'z', x: number, z: number, along: number, across: num
   return g
 }
 
-export function createRoadMeshes(plan: CityPlan, mats: CityMaterials): THREE.Group {
+export function createCrosswalkStripes(cw: CrosswalkSpec): THREE.PlaneGeometry[] {
+  const half = roadHalfWidth(cw.roadCls, cw.axis === 'x' ? cw.x : cw.z)
+  const count = Math.floor(half * 2 / 0.85)
+  return Array.from({ length: count }, (_, i) => {
+    const off = -half + (i + 0.5) * half * 2 / count
+    return plate(cw.axis, cw.x + (cw.axis === 'x' ? off : 0), cw.z + (cw.axis === 'z' ? off : 0), 0.45, 2.8, 0.085)
+  })
+}
+
+export function createRoadMeshes(plan: CityPlan, mats: CityMaterials, network = buildRoadNetwork(plan)): THREE.Group {
   const group = new THREE.Group()
   const rng = mulberry32(5150)
+  const decalMaterial = <T extends THREE.Material>(source: T): T => {
+    const material = source.clone()
+    material.polygonOffset = true
+    material.polygonOffsetFactor = -1
+    material.polygonOffsetUnits = -1
+    return material
+  }
 
   /* ---- intervals along a road that are occupied by a CROSSING street
          (its asphalt + 0.6 m gutter margin). Sidewalks, curbs, bike lanes
@@ -339,6 +334,28 @@ export function createRoadMeshes(plan: CityPlan, mats: CityMaterials): THREE.Gro
       if (road.coord < other.from - 0.5 || road.coord > other.to + 0.5) continue
       const hwO = roadHalfWidth(other.cls, other.coord)
       iv.push([other.coord - hwO - margin, other.coord + hwO + margin])
+    }
+    return iv
+  }
+  const blockedAsphaltIntervals = (road: (typeof plan.roads)[number]): [number, number][] => {
+    const iv: [number, number][] = []
+    for (const other of plan.roads) {
+      // The crossing must contribute its own asphalt. Pedestrian and terminal
+      // roads use separate paving and are not owners of an asphalt junction.
+      if (other.axis === road.axis || other.pedestrianOnly || other.transitOnly) continue
+      if (road.coord < other.from - 0.5 || road.coord > other.to + 0.5) continue
+      const half = roadHalfWidth(other.cls, other.coord)
+      iv.push([other.coord - half, other.coord + half])
+    }
+    return iv
+  }
+  const blockedSidewalkIntervals = (road: (typeof plan.roads)[number]): [number, number][] => {
+    const iv: [number, number][] = []
+    for (const other of plan.roads) {
+      if (other.axis === road.axis) continue
+      if (road.coord < other.from - 0.5 || road.coord > other.to + 0.5) continue
+      const half = roadHalfWidth(other.cls, other.coord) + SIDEWALK_WIDTH[other.cls]
+      iv.push([other.coord - half, other.coord + half])
     }
     return iv
   }
@@ -380,13 +397,42 @@ export function createRoadMeshes(plan: CityPlan, mats: CityMaterials): THREE.Gro
   const slabPlaza: THREE.BufferGeometry[] = []
   const slabCourt: THREE.BufferGeometry[] = []
   for (const b of plan.blocks) {
-    const g = new THREE.BoxGeometry(97, 0.12, 97)
-    g.translate(b.cx, -0.06, b.cz)
-    if (b.zone === 'park') slabGreen.push(g)
-    else if (b.zone === 'plaza') slabPlaza.push(g)
-    else if (b.zone === 'industrial') slabInd.push(g)
-    else if (b.zone === 'downtown' || b.zone === 'commercial' || b.zone === 'mixed') slabCourt.push(g)
-    else slabPaved.push(g)
+    // Keep the block base out of the road and sidewalk footprints. The previous
+    // full 97 m slab sat directly beneath the asphalt (only 2 cm lower) and
+    // every sidewalk, leaving two broad surfaces for the depth buffer to sort.
+    let xs: [number, number][] = [[b.cx - 48.5, b.cx + 48.5]]
+    let zs: [number, number][] = [[b.cz - 48.5, b.cz + 48.5]]
+    const cut = (intervals: [number, number][], center: number, half: number): [number, number][] => {
+      const out: [number, number][] = []
+      for (const [a, end] of intervals) {
+        const lo = center - half, hi = center + half
+        if (hi <= a || lo >= end) out.push([a, end])
+        else {
+          if (lo > a) out.push([a, Math.min(lo, end)])
+          if (hi < end) out.push([Math.max(hi, a), end])
+        }
+      }
+      return out
+    }
+    for (const road of plan.roads) {
+      if (road.transitOnly) continue // separate terminal paving owns this area
+      const half = road.pedestrianOnly ? 4.2 : roadHalfWidth(road.cls, road.coord) + SIDEWALK_WIDTH[road.cls]
+      if (road.axis === 'x' && road.to > b.cx - 48.5 && road.from < b.cx + 48.5) zs = cut(zs, road.coord, half)
+      if (road.axis === 'z' && road.to > b.cz - 48.5 && road.from < b.cz + 48.5) xs = cut(xs, road.coord, half)
+    }
+    const pieces: THREE.BufferGeometry[] = []
+    for (const [x0, x1] of xs) for (const [z0, z1] of zs) {
+      if (x1 - x0 < 0.5 || z1 - z0 < 0.5) continue
+      const g = new THREE.BoxGeometry(x1 - x0, 0.12, z1 - z0)
+      g.translate((x0 + x1) / 2, -0.06, (z0 + z1) / 2)
+      pieces.push(g)
+    }
+    const target = b.zone === 'park' ? slabGreen
+      : b.zone === 'plaza' ? slabPlaza
+      : b.zone === 'industrial' ? slabInd
+      : b.zone === 'downtown' || b.zone === 'commercial' || b.zone === 'mixed' ? slabCourt
+      : slabPaved
+    target.push(...pieces)
   }
   const addMerged = (geos: THREE.BufferGeometry[], mat: THREE.Material, receive = true, cast = false) => {
     if (!geos.length) return
@@ -409,7 +455,8 @@ export function createRoadMeshes(plan: CityPlan, mats: CityMaterials): THREE.Gro
 
   // 3. road strips
   for (const road of plan.roads) {
-    const width = road.cls === 'arterial' ? (road.coord === 0 ? 20 : ROAD_WIDTH.arterial) : ROAD_WIDTH[road.cls]
+    if (road.transitOnly) continue // terminal owns its continuous paving
+    const width = roadHalfWidth(road.cls, road.coord) * 2
     if (road.pedestrianOnly) {
       const g = strip(road.axis, road.coord, road.from, road.to, 8, 0.1, 0.24, 3)
       paverGeos.push(g)
@@ -422,7 +469,16 @@ export function createRoadMeshes(plan: CityPlan, mats: CityMaterials): THREE.Gro
       }
       continue
     }
-    asphaltGeos.push(strip(road.axis, road.coord, road.from, road.to, width, 0.02, 0.16, 6))
+    // Give every junction's north/south (z-axis) road the continuous asphalt
+    // surface. Cut the east/west (x-axis) strip out across it so two coplanar
+    // road tops never compete for the same pixels at an intersection.
+    if (road.axis === 'x') {
+      emit(road.from, road.to, blockedAsphaltIntervals(road), (a, b) => {
+        asphaltGeos.push(strip(road.axis, road.coord, a, b, width, 0.02, 0.16, 6))
+      })
+    } else {
+      asphaltGeos.push(strip(road.axis, road.coord, road.from, road.to, width, 0.02, 0.16, 6))
+    }
     // sidewalks + curbs on both sides, BROKEN at every crossing street.
     // margin 0: the strips end EXACTLY at the crossing asphalt edge — the
     // corner patch then continues the same band flush, so there is no
@@ -431,7 +487,10 @@ export function createRoadMeshes(plan: CityPlan, mats: CityMaterials): THREE.Gro
     for (const s of [-1, 1]) {
       const hw = roadHalfWidth(road.cls, road.coord)
       const off = hw + SIDEWALK_WIDTH[road.cls] / 2
-      emit(road.from, road.to, blocked0, (a, b) => {
+      // Stop each sidewalk at the far edge of the crossing sidewalk band; the
+      // corner patch fills that tile, so it is the only top surface there.
+      const blockedSidewalk = blockedSidewalkIntervals(road)
+      emit(road.from, road.to, blockedSidewalk, (a, b) => {
         sidewalkGeos.push(strip(road.axis, road.coord + s * off, a, b, SIDEWALK_WIDTH[road.cls], 0.14, 0.3, 2.4))
       })
       emit(road.from, road.to, blocked0, (a, b) => {
@@ -440,10 +499,24 @@ export function createRoadMeshes(plan: CityPlan, mats: CityMaterials): THREE.Gro
     }
     if (road.cls === 'arterial' && road.coord === 0) {
       // tram street: track bed + rails — DOUBLE TRACK (±1.6 m, one per direction)
-      trackBedGeos.push(strip(road.axis, road.coord, road.from, road.to, 5.2, 0.035, 0.12))
+      const hasCrossingTrack = road.axis === 'x' && plan.roads.some(other => other.axis === 'z' && other.cls === 'arterial' && other.coord === 0)
+      if (hasCrossingTrack) {
+        // The north/south bed owns the central crossing; avoid a second
+        // coplanar 5.2 m plate over it.
+        emit(road.from, road.to, [[-2.6, 2.6]], (a, b) => {
+          trackBedGeos.push(strip(road.axis, road.coord, a, b, 5.2, 0.035, 0.12))
+        })
+      } else {
+        trackBedGeos.push(strip(road.axis, road.coord, road.from, road.to, 5.2, 0.035, 0.12))
+      }
+      const hasCrossingRails = road.axis === 'x' && plan.roads.some(other => other.axis === 'z' && other.cls === 'arterial' && other.coord === 0)
       for (const t of [-1.6, 1.6]) {
         for (const s of [-0.75, 0.75]) {
-          railGeos.push(strip(road.axis, road.coord + t + s, road.from, road.to, 0.1, 0.11, 0.14))
+          const addRail = (a: number, b: number) => railGeos.push(strip(road.axis, road.coord + t + s, a, b, 0.1, 0.11, 0.14))
+          if (hasCrossingRails) {
+            const crossings = [-2.35, -0.85, 0.85, 2.35].map(center => [center - 0.05, center + 0.05] as [number, number])
+            emit(road.from, road.to, crossings, addRail)
+          } else addRail(road.from, road.to)
         }
       }
     }
@@ -451,8 +524,8 @@ export function createRoadMeshes(plan: CityPlan, mats: CityMaterials): THREE.Gro
 
   // markings per road
   for (const road of plan.roads) {
-    if (road.pedestrianOnly) continue
-    const width = road.cls === 'arterial' ? (road.coord === 0 ? 20 : ROAD_WIDTH.arterial) : ROAD_WIDTH[road.cls]
+    if (road.pedestrianOnly || road.transitOnly) continue
+    const width = roadHalfWidth(road.cls, road.coord) * 2
     const hw = width / 2
     const skipZones = GRID_LINES.map((l) => ({ c: l, r: roadHalfWidth(lineClsOf(l), l) + 2.5 }))
     const clear = (pos: number) => !skipZones.some((z) => Math.abs(pos - z.c) < z.r)
@@ -507,28 +580,65 @@ export function createRoadMeshes(plan: CityPlan, mats: CityMaterials): THREE.Gro
 
   // crosswalk zebras
   for (const cw of plan.crosswalks) {
-    const roadHalf = roadHalfWidth(cw.roadCls === 'arterial' ? 'arterial' : cw.roadCls, cw.axis === 'x' ? cw.z : cw.x)
-    const crossLen = roadHalf * 2
-    const stripeCount = 5
-    for (let i = 0; i < stripeCount; i++) {
-      const off = -1.2 + i * 0.6
-      const g = plate(cw.axis === 'x' ? 'z' : 'x', cw.x + (cw.axis === 'x' ? off : 0), cw.z + (cw.axis === 'x' ? 0 : off), crossLen, 0.42, 0.085)
-      whiteGeos.push(g)
-    }
+    whiteGeos.push(...createCrosswalkStripes(cw))
   }
 
-  // stop lines at signalized intersections — right at the piece end
-  // (pieces are pulled back to the crossing edge + 1.2 m)
-  for (const tl of plan.trafficLights) {
-    const hwA = roadHalfWidth('arterial', 0)
-    const edge = hwA + 2.0
-    for (const s of [-1, 1]) {
-      // x-approach stop line (spanning both approach lanes)
-      const g1 = plate('z', tl.x + s * edge, tl.z, 0.45, 7.4, 0.1)
-      whiteGeos.push(g1)
-      // z-approach stop line
-      const g2 = plate('x', tl.x, tl.z + s * edge, 7.4, 0.45, 0.1)
-      whiteGeos.push(g2)
+  const polygon = (points: { x: number; z: number }[], geos = whiteGeos) => {
+    const shape = new THREE.Shape(points.map(p => new THREE.Vector2(p.x, -p.z)))
+    const geo = new THREE.ShapeGeometry(shape)
+    geo.rotateX(-Math.PI / 2)
+    geo.translate(0, 0.09, 0)
+    geos.push(geo)
+  }
+  const line = (a: { x: number; z: number }, b: { x: number; z: number }, width = 0.12, geos = whiteGeos) => {
+    const length = Math.hypot(b.x - a.x, b.z - a.z)
+    const rx = -(b.z - a.z) / length * width / 2, rz = (b.x - a.x) / length * width / 2
+    polygon([{ x: a.x + rx, z: a.z + rz }, { x: b.x + rx, z: b.z + rz }, { x: b.x - rx, z: b.z - rz }, { x: a.x - rx, z: a.z - rz }], geos)
+  }
+  // Stop bars and lane arrows come from the same final lanes as the cars.
+  // No paint crosses the tram bed or suggests a turn from the wrong pocket.
+  for (const lane of network.lanes.values()) {
+    if (!lane.signalId) continue
+    const length = Math.hypot(lane.x2 - lane.x1, lane.z2 - lane.z1)
+    const fx = (lane.x2 - lane.x1) / length, fz = (lane.z2 - lane.z1) / length
+    const point = (u: number, v: number) => ({ x: lane.x2 - fz * u + fx * v, z: lane.z2 + fx * u + fz * v })
+    const half = (lane.laneWidth ?? 3) / 2 - 0.1
+    line(point(-half, 0), point(half, 0), 0.45)
+    if (!lane.pocket) continue
+    for (const distance of [10, 21]) {
+      const p = (u: number, v: number) => point(u, v - distance)
+      line(p(0, -2), p(0, 0.8), 0.22)
+      if (lane.pocket === 'left') {
+        line(p(0, 0.8), p(-1.05, 0.8), 0.22)
+        polygon([p(-1.3, 0.8), p(-0.65, 0.2), p(-0.65, 1.4)])
+      } else {
+        polygon([p(0, 1.8), p(-0.55, 0.7), p(0.55, 0.7)])
+        line(p(0, -0.2), p(0.9, 0.8), 0.2)
+        polygon([p(1.2, 1.1), p(0.35, 0.9), p(0.9, 0.25)])
+      }
+    }
+    if (lane.pocket === 'left') {
+      for (let d = 3; d < 27; d += 4) line(point((lane.laneWidth ?? 3) / 2, -d), point((lane.laneWidth ?? 3) / 2, -d - 2), 0.12)
+    }
+  }
+  // Keep-clear boxes make the reserved junction area legible, with the rails
+  // still continuous. Cycle crossings continue across each junction mouth.
+  for (const signal of plan.trafficLights) {
+    const hwX = roadHalfWidth(lineClsOf(signal.x), signal.x)
+    const hwZ = roadHalfWidth(lineClsOf(signal.z), signal.z)
+    const x0 = signal.x - hwX + 1, x1 = signal.x + hwX - 1
+    const z0 = signal.z - hwZ + 1, z1 = signal.z + hwZ - 1
+    line({ x: x0, z: z0 }, { x: x1, z: z0 }, 0.12, yellowGeos)
+    line({ x: x1, z: z0 }, { x: x1, z: z1 }, 0.12, yellowGeos)
+    line({ x: x1, z: z1 }, { x: x0, z: z1 }, 0.12, yellowGeos)
+    line({ x: x0, z: z1 }, { x: x0, z: z0 }, 0.12, yellowGeos)
+    for (let offset = -(z1 - z0) + 4; offset < x1 - x0; offset += 4) {
+      const t0 = Math.max(0, -offset), t1 = Math.min(z1 - z0, x1 - x0 - offset)
+      if (t1 > t0) line({ x: x0 + offset + t0, z: z0 + t0 }, { x: x0 + offset + t1, z: z0 + t1 }, 0.1, yellowGeos)
+    }
+    for (const side of [-1, 1]) {
+      bikeGeos.push(strip('x', signal.z + side * (hwZ - 1), signal.x - hwX, signal.x + hwX, 1.6, 0.055, 0.02))
+      bikeGeos.push(strip('z', signal.x + side * (hwX - 1), signal.z - hwZ, signal.z + hwZ, 1.6, 0.055, 0.02))
     }
   }
 
@@ -538,8 +648,8 @@ export function createRoadMeshes(plan: CityPlan, mats: CityMaterials): THREE.Gro
   // the two streets never reaches the junction
   for (const x of GRID_LINES) {
     for (const z of GRID_LINES) {
-      const roadAlongX = plan.roads.some((r) => r.axis === 'x' && r.coord === z && r.from < x && r.to > x)
-      const roadAlongZ = plan.roads.some((r) => r.axis === 'z' && r.coord === x && r.from < z && r.to > z)
+      const roadAlongX = plan.roads.some((r) => r.axis === 'x' && r.coord === z && r.from <= x + 0.1 && r.to >= x - 0.1)
+      const roadAlongZ = plan.roads.some((r) => r.axis === 'z' && r.coord === x && r.from <= z + 0.1 && r.to >= z - 0.1)
       if (!roadAlongX || !roadAlongZ) continue
       const hwX = roadHalfWidth(lineClsOf(x), x)
       const hwZ = roadHalfWidth(lineClsOf(z), z)
@@ -563,9 +673,11 @@ export function createRoadMeshes(plan: CityPlan, mats: CityMaterials): THREE.Gro
   addMerged(paverGeos, mats.parkPath, true, false)
   addMerged(sidewalkGeos, mats.sidewalk, true, false)
   addMerged(curbGeos, mats.curb, true, false)
-  addMerged(whiteGeos, mats.roadLine)
-  addMerged(yellowGeos, mats.roadLineYellow)
-  addMerged(bikeGeos, mats.bikeLane)
+  // These are intentional overlays on road tops. A small polygon offset keeps
+  // the paint stable at distance without changing the shared city materials.
+  addMerged(whiteGeos, decalMaterial(mats.roadLine))
+  addMerged(yellowGeos, decalMaterial(mats.roadLineYellow))
+  addMerged(bikeGeos, decalMaterial(mats.bikeLane))
   addMerged(trackBedGeos, mats.tramTrack)
   addMerged(railGeos, mats.metalDark)
   void rng

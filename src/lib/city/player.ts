@@ -39,9 +39,10 @@ export class FirstPersonController {
   input: InputState = { f: false, b: false, l: false, r: false, jump: false, sprint: false, crouch: false }
   /** analog joystick axes (−1..1) — take precedence over the digital flags */
   touchAxes = { x: 0, z: 0 }
+  onLockError?: () => void
   onInteract?: () => void
   onToggleStats?: () => void
-  onToggleTour?: () => void
+  onToggleTour?: (reverse: boolean) => void
   enabled = false
 
   constructor(camera: THREE.PerspectiveCamera, domElement: HTMLElement, colliders: AABB[], bounds: number, spawn: { x: number; z: number }) {
@@ -77,7 +78,7 @@ export class FirstPersonController {
   requestLock = () => {
     if (!this.enabled || this.isTouch) return
     if (document.pointerLockElement !== this.domElement) {
-      this.domElement.requestPointerLock()
+      this.domElement.requestPointerLock()?.catch(() => this.onLockError?.())
     }
   }
 
@@ -167,7 +168,7 @@ export class FirstPersonController {
       return
     }
     if (e.code === 'KeyT') {
-      this.onToggleTour?.()
+      if (!e.repeat) this.onToggleTour?.(e.shiftKey)
       return
     }
     this.keys.add(e.code)

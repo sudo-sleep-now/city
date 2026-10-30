@@ -1,4 +1,4 @@
-import { CITY, GRID_LINES, lineClass } from './constants'
+import { CITY, GRID_LINES, SIDEWALK_WIDTH, lineClass } from './constants'
 import type {
   AABB,
   Block,
@@ -23,25 +23,23 @@ import type {
  * POI panels + stats):
  *  - Downtown (high density, offices + mixed towers) within the
  *    arterial square [-200,200]², so through-traffic can bypass it.
- *  - Central Park 200×200 m directly north of downtown — walkable
- *    from every downtown block and from the Parkside district.
+ *  - Central Park 200×200 m directly north of downtown, near
+ *    downtown and Parkside destinations.
  *  - Tram lines on both central arterials (x=0, z=0) connect all
  *    districts; density decreases with distance from tram stops.
  *  - One car-free shopping street (x=100 through downtown).
  *  - Industrial SE corner: downwind edge, rail-served, direct
  *    arterial (x=400) + ring access, far from most homes.
- *  - Schools: 3 elementary schools, each inside a residential
- *    quadrant → every home within ~500 m walking distance.
- *  - Hospital near arterial x=400/z=0 for emergency access.
- *  - Fire station west of downtown; police east — both reach the
- *    arterial grid in <30 s.
- *  - Pocket parks + gardens distributed so most homes are within
- *    300 m of green space.
+ *  - Schools and services are distributed through residential areas;
+ *    straight-line distances are planning indicators, not walking routes.
+ *  - Emergency-service sites connect to streets; response times are not simulated.
+ *  - Pocket parks + gardens are distributed through residential areas;
+ *    computed proximity figures use straight-line distance.
  * ============================================================ */
 
 /** half road width incl. tram median on central arterials */
 export function roadHalfWidth(cls: string, coord: number): number {
-  if (cls === 'arterial') return coord === 0 ? 10 : 8
+  if (cls === 'arterial') return coord === 0 ? 11 : 8
   if (cls === 'collector') return 5.5
   return 3.5
 }
@@ -93,6 +91,12 @@ export function planCity(): CityPlan {
       roads.push({ id: `r${coord < 0 ? 'n' : coord > 0 ? 'p' : 'c'}${Math.abs(coord)}-${'x'}`, axis: 'z', coord, from: -600, to: 600, cls })
     }
   }
+  // A one-way bus loop stays inside the forecourt, leaving the tram avenue
+  // and its pavement clear. The east street supplies both access points.
+  roads.push(
+    { id: 'solheim-bus-in', axis: 'x', coord: -124, from: 35, to: 100, cls: 'local', transitOnly: true },
+    { id: 'solheim-bus-out', axis: 'x', coord: -108, from: 35, to: 100, cls: 'local', transitOnly: true },
+  )
 
   /* ---------------- block classification ---------------- */
   const pocketParks = new Set(['1,5', '2,10', '9,3', '10,7', '4,2', '7,10', '1,8', '8,10'])
@@ -166,7 +170,7 @@ export function planCity(): CityPlan {
     const swap = spec.rotation === 90 || spec.rotation === 270
     const w = swap ? spec.d : spec.w
     const d = swap ? spec.w : spec.d
-    colliders.push({ minX: spec.x - w / 2, maxX: spec.x + w / 2, minZ: spec.z - d / 2, maxZ: spec.z + d / 2, h: spec.height })
+    if (spec.kind !== 'transit-hub') colliders.push({ minX: spec.x - w / 2, maxX: spec.x + w / 2, minZ: spec.z - d / 2, maxZ: spec.z + d / 2, h: spec.height })
     return id
   }
 
@@ -340,10 +344,10 @@ export function planCity(): CityPlan {
   /* ---------------- special buildings ---------------- */
   // Central Transit Hub (block 6,4: x 0..100, z -200..-100)
   {
-    const id = addBuilding({ kind: 'transit-hub', x: 50, z: -148, w: 64, d: 30, rotation: 0, floors: 3, height: 13, facadeVariant: 6, units: 0, jobs: 45, label: 'CENTRAL STATION', enterableId: 'hub' })
-    enterables.push({ id, buildingId: id, name: 'Central Station — Transit Hall', interiorKind: 'hub', doorX: 50, doorZ: -133, facing: 0, w: 60, d: 26, h: 12 })
-    stops.push({ id: 'st-hub', x: 14, z: -110, mode: 'tram', name: 'Central Hub', routeIds: ['T1', 'T2'] })
-    stops.push({ id: 'st-hub-bus', x: 86, z: -104, mode: 'bus', name: 'Central Hub Bus', routeIds: ['B1'] })
+    const id = addBuilding({ kind: 'transit-hub', x: 50, z: -148, w: 64, d: 30, rotation: 0, floors: 3, height: 13, facadeVariant: 6, units: 0, jobs: 45, label: 'SOLHEIM INTERCHANGE' })
+    // Walk through the real glazed hall. No detached interior teleport.
+    // The tram lines remain on the central arterials. The nearby T1 stop is
+    // linked to this hall by a signed pedestrian path, not a station platform.
   }
   // Market Hall (block 5,5: x -100..0, z -100..0)
   {
@@ -352,8 +356,8 @@ export function planCity(): CityPlan {
   }
   // Café pavilion on the plaza (block 6,5)
   {
-    const id = addBuilding({ kind: 'retail', x: 78, z: -22, w: 14, d: 11, rotation: 0, floors: 1, height: 4.6, facadeVariant: 5, units: 0, jobs: 8, label: 'CAFÉ VERDE', enterableId: 'cafe' })
-    enterables.push({ id, buildingId: id, name: 'Café Verde', interiorKind: 'cafe', doorX: 78, doorZ: -16.5, facing: 0, w: 13, d: 10, h: 4.2 })
+    const id = addBuilding({ kind: 'retail', x: 78, z: -22, w: 14, d: 11, rotation: 180, floors: 1, height: 4.6, facadeVariant: 5, units: 0, jobs: 8, label: 'CAFÉ VERDE', enterableId: 'cafe' })
+    enterables.push({ id, buildingId: id, name: 'Café Verde', interiorKind: 'cafe', doorX: 78, doorZ: -27.5, facing: 180, w: 13, d: 10, h: 4.2 })
   }
   // Grocery (block 4,6)
   {
@@ -372,10 +376,10 @@ export function planCity(): CityPlan {
     // side where the TOWER (z=-28) stands 21 m away and buried the entrance
     // in a dead courtyard. Flipped, it faces the z=-100 street + plaza.
     addBuilding({ kind: 'hospital', x: 250, z: -62, w: 58, d: 26, rotation: 180, floors: 3, height: 12, facadeVariant: 7, units: 0, jobs: 90, label: 'CITY HOSPITAL' })
-    // tower pushed to z=-28: at z=-18 its south face (d=26 → z=-5) stuck
-    // 5 m INTO the 20 m wide z=0 arterial (road spans z -10..10) — cars in
-    // the north lanes clipped straight through the facade
-    addBuilding({ kind: 'hospital', x: 250, z: -28, w: 30, d: 26, rotation: 0, floors: 9, height: 32, facadeVariant: 6, units: 0, jobs: 120, label: '' })
+    // Keep the entire pavement clear when the central avenue gains turn-lane
+    // width. The tower's south facade starts beyond the 5m walking strip.
+    const towerZ = -(roadHalfWidth('arterial', 0) + SIDEWALK_WIDTH.arterial + 13)
+    addBuilding({ kind: 'hospital', x: 250, z: towerZ, w: 30, d: 26, rotation: 0, floors: 9, height: 32, facadeVariant: 6, units: 0, jobs: 120, label: '' })
   }
   // City Library (block 7,3 — beside Central Park, on the school walk-route)
   {
@@ -416,7 +420,7 @@ export function planCity(): CityPlan {
 
   /* ---------------- parks ---------------- */
   parks.push({ id: 'park-central', kind: 'central-park', x0: -100, z0: -400, x1: 100, z1: -200, name: 'Central Park' })
-  parks.push({ id: 'park-plaza', kind: 'plaza', x0: 0, z0: -100, x1: 100, z1: 0, name: 'Civic Plaza' })
+  parks.push({ id: 'park-plaza', kind: 'plaza', x0: 0, z0: -100, x1: 100, z1: 0, name: 'Solheim Square' })
   parks.push({ id: 'park-sports', kind: 'sports', x0: -100, z0: 300, x1: 0, z1: 400, name: 'Southfield Sports Park' })
   parks.push({ id: 'park-garden', kind: 'garden', x0: 200, z0: 200, x1: 300, z1: 300, name: 'Community Gardens' })
   const pocketCoords: [number, number][] = [[1, 5], [2, 10], [9, 3], [10, 7], [4, 2], [7, 10], [1, 8], [8, 10]]
@@ -428,7 +432,7 @@ export function planCity(): CityPlan {
 
   /* ---------------- transit routes & stops ---------------- */
   const tramStopsT1: [number, string][] = [
-    [-400, 'North Terminal'], [-300, 'Park North'], [-200, 'Central Park'], [0, 'Central Hub'], [200, 'Civic Plaza'], [400, 'Southfield'], [580, 'South Terminal'],
+    [-400, 'North Terminal'], [-300, 'Park North'], [-200, 'Central Park'], [-182, 'Interchange Walk'], [0, 'Central Hub'], [200, 'Civic Plaza'], [400, 'Southfield'], [580, 'South Terminal'],
   ]
   tramStopsT1.forEach(([z, name]) => stops.push({ id: `t1-${z}`, x: 0, z, mode: 'tram', name, routeIds: ['T1'] }))
   const tramStopsT2: [number, string][] = [
@@ -440,10 +444,18 @@ export function planCity(): CityPlan {
 
   const busStopsB1: [number, number, string][] = [
     [0, -200, 'North Inner'], [200, 0, 'East Inner'], [0, 200, 'South Inner'], [-200, 0, 'West Inner'],
+    [55, -124, 'Solheim Interchange — B1 City Loop'],
   ]
   busStopsB1.forEach(([x, z, name]) => stops.push({ id: `b1-${x}-${z}`, x, z, mode: 'bus', name, routeIds: ['B1'] }))
   routes.push({ id: 'B1', mode: 'bus', name: 'Bus B1 — Inner Loop', color: '#a16207', points: [
-    { x: -200, z: -200 }, { x: 200, z: -200 }, { x: 200, z: 200 }, { x: -200, z: 200 }, { x: -200, z: -200 },
+    // Arrive from the north, stop beside the hall, turn inside the forecourt,
+    // then leave to the south. An 8 m centreline radius fits the bus turn.
+    { x: -200, z: -200 }, { x: 100, z: -200 },
+    { x: 100, z: -132 }, { x: 92, z: -124 }, { x: 55, z: -124 },
+    { x: 35, z: -124 }, { x: 29.34, z: -121.66 }, { x: 27, z: -116 },
+    { x: 29.34, z: -110.34 }, { x: 35, z: -108 },
+    { x: 92, z: -108 }, { x: 100, z: -100 }, { x: 200, z: -100 },
+    { x: 200, z: 200 }, { x: -200, z: 200 }, { x: -200, z: -200 },
   ], stopIds: busStopsB1.map(([x, z]) => `b1-${x}-${z}`) })
 
   const busStopsB2: [number, number, string][] = [
@@ -523,82 +535,82 @@ export function planCity(): CityPlan {
     const hwX = roadHalfWidth(lineClass(tl.x), tl.x)
     const hwZ = roadHalfWidth(lineClass(tl.z), tl.z)
     // two crossings per intersection (one across each road), offset from center
-    crosswalks.push({ x: tl.x, z: tl.z - hwZ - 2.2, axis: 'x', roadCls: 'arterial' })
-    crosswalks.push({ x: tl.x, z: tl.z + hwZ + 2.2, axis: 'x', roadCls: 'arterial' })
-    crosswalks.push({ x: tl.x - hwX - 2.2, z: tl.z, axis: 'z', roadCls: 'arterial' })
-    crosswalks.push({ x: tl.x + hwX + 2.2, z: tl.z, axis: 'z', roadCls: 'arterial' })
+    crosswalks.push({ x: tl.x, z: tl.z - hwZ - 2.2, axis: 'x', roadCls: lineClass(tl.x) })
+    crosswalks.push({ x: tl.x, z: tl.z + hwZ + 2.2, axis: 'x', roadCls: lineClass(tl.x) })
+    crosswalks.push({ x: tl.x - hwX - 2.2, z: tl.z, axis: 'z', roadCls: lineClass(tl.z) })
+    crosswalks.push({ x: tl.x + hwX + 2.2, z: tl.z, axis: 'z', roadCls: lineClass(tl.z) })
   }
 
   /* ---------------- POIs ---------------- */
   pois.push(
     {
       id: 'poi-park', x: -55, z: -345, radius: 60, title: 'Central Park', category: 'Green Infrastructure',
-      description: 'A 200×200 m park directly north of downtown. Placed here so EVERY downtown worker and Parkside resident is within a 5-minute walk of green space. Distributing parks like this beats one giant park at the edge: average walk to green is under 300 m citywide.',
-      facts: [['Size', '200 × 200 m (4 ha)'], ['Features', 'Pond, playground, lawns, pavilion'], ['Walkable from', 'Downtown + Parkside'], ['Accessible', 'Paths, no steps, tram at 2 edges']],
+      description: 'A 200×200 m park directly north of downtown. Its central location and surrounding paths support nearby trips on foot, though actual walking distance depends on entrances and crossings. Citywide distance figures are straight-line estimates.',
+      facts: [['Size', '200 × 200 m (4 ha)'], ['Features', 'Pond, playground, lawns, pavilion'], ['Nearby', 'Downtown + Parkside'], ['Access', 'Paths and tram stops at two edges']],
     },
     {
-      id: 'poi-plaza', x: 50, z: -50, radius: 45, title: 'Civic Plaza & Central Station', category: 'Transport / Public Space',
-      description: 'The heart of Solheim. The main tram lines (T1 N–S, T2 E–W) and inner bus loop cross here. Highest building densities in the city are within 300 m — putting homes and jobs next to transit is what keeps car use low.',
-      facts: [['Transit', 'Tram T1 + T2, Bus B1'], ['Population served', '≈13,000 citywide — densest square km in Solheim'], ['Design', 'Car-free, trees + seating'], ['Shops', 'Market Hall & cafés adjacent']],
+      id: 'poi-plaza', x: 50, z: -50, radius: 45, title: 'Solheim Square & Interchange', category: 'Transport / Public Space',
+      description: 'The heart of the proposed district: a fountain and clock landmark, shaded garden seating, market kiosks and a café terrace facing the square. Open walking routes connect these meeting places to the surrounding streets. B1 buses board at the interchange across the northern street, with T1 on the neighbouring avenue. This illustrates a more inviting transit centre; it does not predict how people will travel.',
+      facts: [['Transit', 'B1 City Loop; walk to T1'], ['Square', 'Fountain, clock landmark and shaded garden'], ['Street life', 'Market kiosks + a café terrace'], ['Access', 'Open walking routes around the fountain']],
     },
     {
       id: 'poi-skylink', x: 149, z: -148, radius: 50, title: 'Skylink Towers', category: 'Landmark / Density Done Right',
-      description: 'Solheim\u2019s landmark: two glass towers of different heights — 30 and 24 floors — rising from one retail podium and bridged by a glazed sky lobby at level 18. Walk in: the public lobby holds a café and a panoramic elevator that rides the west face of the tall tower up to the open-air SKY DECK at 79 m — the best view in the city. The tallest offices sit EXACTLY on the transit cross: every worker is one block from the Central Station plaza, so the 520 desks generate almost no car traffic. Height is earned by location, not spread randomly.',
-      facts: [['Towers', '101 m + 74 m, bridged at 56 m'], ['Public', 'Lobby + panoramic lift + sky deck at 79 m'], ['Jobs', '≈520 sky offices + podium retail'], ['Transit', 'Tram T1/T2 + B1 one block west']],
+      description: 'A proposed mixed-use landmark near the central transit hub. The modeled towers and podium represent an infill option that could put offices and services near transit. Proximity alone cannot guarantee low car use; service frequency, affordability and access from outer neighbourhoods also matter.',
+      facts: [['Towers', '101 m + 74 m, bridged at 56 m'], ['Public', 'Lobby + panoramic lift + sky deck at 79 m'], ['Employment', 'Illustrative capacity, not a forecast'], ['Transit', 'Tram T1/T2 + B1 one block west']],
     },
     {
       id: 'poi-market', x: -52, z: -50, radius: 35, title: 'Market Hall', category: 'Essential Services',
-      description: 'Fresh food and daily goods in the center. Grocery access is treated like utilities: every neighborhood cluster has one within ~400 m, so nobody needs a car for groceries.',
-      facts: [['Enterable', 'Yes — walk in (E)'], ['Jobs', '≈60'], ['Catchment', 'Downtown + 2 districts']],
+      description: 'A central market hall concept for fresh food and daily goods. Adding convenient local services can reduce the need for some longer errands, though the scene does not guarantee store availability or car-free shopping for every household.',
+      facts: [['Enterable', 'Yes — walk in (E)'], ['Jobs', 'Illustrative estimate'], ['Nearby', 'Downtown and adjacent districts']],
     },
     {
       id: 'poi-hospital', x: 250, z: -40, radius: 55, title: 'City Hospital', category: 'Essential Services',
-      description: 'Located beside arterial z=0 and tram T2: ambulances reach the arterial grid in seconds, while staff and visitors arrive by tram instead of driving. Not in downtown: keeps land costs down and avoids congestion.',
+      description: 'The hospital sits beside arterial z=0 and tram T2, giving staff, visitors and emergency services more than one modeled access option. Its position is a land-use concept, not an emergency response plan.',
       facts: [['Access', 'Tram T2 "Hospital" stop'], ['Emergency', 'Direct arterial + ring access'], ['Roof', 'Helipad']],
     },
     {
       id: 'poi-fire', x: -252, z: 148, radius: 40, title: 'Fire Station 2', category: 'Essential Services',
-      description: 'West of downtown on a collector with instant arterial access. A 4-minute drive covers 90% of the city — response time beats coverage area, so it sits at the edge of the dense core, not far away in cheap land.',
-      facts: [['Vehicles', '2 engines + ladder'], ['Coverage', 'Whole city < 5 min']],
+      description: 'A fire station site beside a collector, illustrating how emergency facilities can connect to the street network. Detailed coverage planning would pair station locations with local operational and traffic data.',
+      facts: [['Vehicles', 'Illustrative engines + ladder'], ['Access', 'Collector street connection']],
     },
     {
       id: 'poi-fire1', x: 330, z: -40, radius: 45, title: 'Fire Station 1 — East Battalion', category: 'Essential Services',
-      description: 'The dispatch house: fire engine and ambulance roll straight off the z=0 arterial curb. Sits mid-way between the hospital and downtown so the first rig is on scene in under two minutes anywhere in the core.',
+      description: 'A second emergency-service site beside arterial z=0 and near the hospital. Together the two sites illustrate possible locations to evaluate in a citywide service plan.',
       facts: [['Responds with', 'Engine + ambulance'], ['Access', 'Arterial z=0, westbound lane'], ['Bays', '3 drive-through doors']],
     },
     {
       id: 'poi-police', x: 252, z: 52, radius: 40, title: 'Police HQ', category: 'Essential Services',
-      description: 'East of downtown. Pairs with the fire station principle: emergency services ring the core so no district is ever far from help.',
+      description: 'A police HQ site east of downtown with access to the arterial and collector street network. The layout alone does not establish response coverage.',
       facts: [['Access', 'Arterial z=0 + collector x=200']],
     },
     {
       id: 'poi-school-maple', x: -252, z: -266, radius: 45, title: 'Maple Elementary', category: 'Education',
-      description: 'Every residential quadrant gets its own elementary school inside the neighborhood — children walk or cycle, so school runs do not generate car traffic. Schoolyards double as weekend parks.',
-      facts: [['Walkshed', '≈500 m radius'], ['Safe routes', 'Traffic-calmed locals (20 km/h)'], ['Yard', 'Sports pitch, public after hours']],
+      description: 'A neighborhood school site with nearby local streets. Safe crossings, supervised routes and school travel planning would help families choose walking or cycling; the model cannot assume that school trips generate no car traffic.',
+      facts: [['Distance', 'Straight-line indicator, not a route'], ['Proposal', 'Traffic-calmed school approaches'], ['Yard', 'Sports pitch, public after hours']],
     },
     {
       id: 'poi-school-northgate', x: 252, z: -266, radius: 45, title: 'Northgate Elementary', category: 'Education',
-      description: 'Same principle as Maple Elementary: school inside the neighborhood, 20 km/h streets around it, walking bus routes. Distance to school is a main driver of childhood independence.',
-      facts: [['Walkshed', '≈500 m radius']],
+      description: 'A school site inside the Northgate neighborhood. A walking bus, safer crossings and traffic-calmed streets are possible supporting measures; they would need to be planned with families and local operators.',
+      facts: [['Distance', 'Straight-line indicator, not a route'], ['Proposal', 'Walking bus and safer crossings']],
     },
     {
       id: 'poi-school-greenfield', x: -252, z: 338, radius: 45, title: 'Greenfield Elementary', category: 'Education',
       description: 'South quadrant elementary school. Note the pocket park one block away — school + park + homes form a walkable "neighborhood unit".',
-      facts: [['Walkshed', '≈500 m radius']],
+      facts: [['Distance', 'Straight-line indicator, not a route']],
     },
     {
       id: 'poi-library', x: 150, z: -240, radius: 42, title: 'City Library', category: 'Education / Third Places',
-      description: 'A free warm space for everyone, placed between Central Park, the NE school walk-route and the tram avenue. Libraries are the city\'s shared living room: study, events, community — no purchase required. Distributed civic buildings like this keep public life on the street, not behind car trips.',
-      facts: [['Enterable', 'Yes — reading hall (E)'], ['Walkshed', 'Park + 2 districts'], ['Transit', 'T1 "Central Park" stop 3 min'], ['Free', 'No ticket, no car needed']],
+      description: 'A library concept between Central Park, the Northgate school and the tram avenue. A nearby public destination adds another local option for study, events and community use. Its actual catchment depends on opening hours and the street network.',
+      facts: [['Enterable', 'Yes — reading hall (E)'], ['Nearby', 'Park and Northgate school'], ['Transit', 'T1 Central Park stop nearby'], ['Access', 'Public service concept']],
     },
     {
       id: 'poi-clinic', x: 352, z: -244, radius: 40, title: 'Northgate Walk-in Clinic', category: 'Essential Services',
-      description: 'A small clinic embedded in the NE neighborhood: everyday care within a walk, keeping the City Hospital free for acute and emergency medicine. Distributed clinics cut car trips and catch illness earlier — a core layer of the 15-minute services grid.',
-      facts: [['Enterable', 'Yes — waiting room (E)'], ['Neighbors', 'Pocket park + Northgate Elementary'], ['Role', 'Non-urgent care, vaccines, check-ups'], ['Hospital', '≈5 min by tram T1 for acute cases']],
+      description: 'A small clinic concept in the NE neighborhood for everyday care. A local option may shorten some trips, but service availability and travel choices depend on staffing, opening hours and actual route connections.',
+      facts: [['Enterable', 'Yes — waiting room (E)'], ['Neighbors', 'Pocket park + Northgate Elementary'], ['Role', 'Non-urgent care, vaccines, check-ups'], ['Hospital', 'City Hospital is on tram T2']],
     },
     {
       id: 'poi-industrial', x: 420, z: 420, radius: 80, title: 'Ironworks — Industrial District', category: 'Economy',
-      description: 'Industry sits in the SE corner: separated from homes, downwind of prevailing westerlies, rail-served, with direct access to arterial x=400 and the ring road so trucks never cross residential streets. Buffering greenery blocks noise.',
+      description: 'Industry is placed in the SE corner with modeled rail and arterial connections. A detailed freight plan would still be needed to route trucks and manage noise, air quality and impacts on nearby streets.',
       facts: [['Jobs', '≈350'], ['Freight', 'Rail siding + truck route'], ['Buffer', 'Tree belt + no homes adjacent']],
     },
     {
@@ -613,8 +625,23 @@ export function planCity(): CityPlan {
     },
     {
       id: 'poi-pedstreet', x: 0, z: 100, radius: 55, title: 'Car-free Shopping Street', category: 'Walkability',
-      description: 'The car-free street through downtown is closed to cars: bollards at both gates, trees, benches, café terraces. Retail thrives on foot traffic, and removing cars is the cheapest traffic-calming there is.',
+      description: 'The modeled car-free street through downtown uses bollards, trees and benches. This proposal prioritizes pedestrian access while retaining scheduled delivery access; outcomes for local businesses would depend on implementation and access arrangements.',
       facts: [['Length', '400 m'], ['Access', 'Pedestrians + delivery before 9 am'], ['Shops', '≈24 ground-floor units']],
+    },
+    {
+      id: 'poi-north-transfer', x: 325, z: -580, radius: 30, title: 'Northgate Ring Transfer Point', category: 'Mobility Pilot',
+      description: 'A proposed neighborhood transfer point beside the existing B2 ring stop. The compact canopy, seating, bicycle hoops and route marker are intended to make transfers to outer-neighborhood bus routes more comfortable. A timed connection and reliable service would need to be agreed with the wider network operator.',
+      facts: [['Existing service', 'B2 ring bus stop nearby'], ['Proposal', 'Shelter, seating, cycle parking, wayfinding'], ['Future option', 'Test accessible drop-off or car-share bay if curb space allows']],
+    },
+    {
+      id: 'poi-cycle-network', x: -585, z: -25, radius: 30, title: 'West Ring Safe Routes Link', category: 'Active Travel Proposal',
+      description: 'This edge point marks a proposed safe-route connection from the ring stop into Westbrook. Continuous protected cycling links, safe arterial crossings and clear wayfinding would connect outer neighbourhoods to local services and transit.',
+      facts: [['Connection', 'B2 West Terminal to local streets'], ['Priority', 'Protected links and safer crossings'], ['Measure', 'Check continuity and access in detailed design']],
+    },
+    {
+      id: 'poi-east-infill', x: 585, z: 21, radius: 34, title: 'Eastgate Local Services Infill', category: 'Neighbourhood Planning',
+      description: 'A suggested infill area near the East Terminal bus stop for small shops, daily services or flexible community space. Locating useful destinations near an existing route could shorten some errands and support car-independent options while retaining access for residents who still need to drive.',
+      facts: [['Nearby service', 'B2 East Terminal'], ['Concept', 'Small-scale mixed-use infill'], ['Next step', 'Test demand, access, servicing and affordability']],
     },
   )
 
@@ -635,7 +662,7 @@ export function planCity(): CityPlan {
     crosswalks,
     enterables,
     stats,
-    spawn: { x: 50, z: -30 },
+    spawn: { x: 50, z: -20 },
     minimapSeeds: pois.map((p) => ({ x: p.x, z: p.z, color: '#f59e0b' })),
   }
 }
@@ -647,6 +674,8 @@ function computeStats(
   roads: RoadSpec[],
   schools: [number, number, string][],
 ): CityStats {
+  // Proximity outputs are Euclidean estimates from point locations, not
+  // route distances, travel times, or measured walking catchments.
   let units = 0
   let jobs = 0
   const residentialCenters: { x: number; z: number; units: number }[] = []

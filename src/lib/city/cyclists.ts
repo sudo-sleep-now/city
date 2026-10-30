@@ -1,6 +1,7 @@
 import * as THREE from 'three'
+import { roadHalfWidth } from './planner'
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js'
-import { MAX_CYCLISTS, ROAD_WIDTH } from './constants'
+import { MAX_CYCLISTS } from './constants'
 import type { CityMaterials, CityPlan } from './types'
 
 /* ============================================================
@@ -75,7 +76,7 @@ export class CyclistSystem {
     for (const road of plan.roads) {
       if (road.pedestrianOnly) continue
       if (road.cls !== 'arterial' && road.cls !== 'collector') continue
-      const width = road.cls === 'arterial' ? (road.coord === 0 ? 20 : ROAD_WIDTH.arterial) : ROAD_WIDTH[road.cls]
+      const width = roadHalfWidth(road.cls, road.coord) * 2
       const off = width / 2 - 1.0
       if (road.axis === 'x') {
         // eastbound (+x) keeps right → positive z side

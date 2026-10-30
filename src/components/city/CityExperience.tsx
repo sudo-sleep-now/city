@@ -8,6 +8,7 @@ import IntroOverlay from './IntroOverlay'
 import InfoPanel from './InfoPanel'
 import StatsPanel from './StatsPanel'
 import Minimap from './Minimap'
+import TrafficLab from './TrafficLab'
 
 /** coarse-pointer devices get on-screen controls */
 const isTouchDevice = () =>
@@ -15,10 +16,11 @@ const isTouchDevice = () =>
 
 export default function CityExperience() {
   const containerRef = useRef<HTMLDivElement>(null)
-  const [, setEngineReady] = useState(false)
+  const [loadError, setLoadError] = useState(false)
   const ready = useCityStore((s) => s.ready)
   const started = useCityStore((s) => s.started)
   const paused = useCityStore((s) => s.paused)
+  const trafficLab = useCityStore((s) => s.showTrafficLab)
   const fade = useCityStore((s) => s.fade)
   const toast = useCityStore((s) => s.toast)
   const loadingProgress = useCityStore((s) => s.loadingProgress)
@@ -28,40 +30,55 @@ export default function CityExperience() {
   useEffect(() => {
     if (!containerRef.current) return
     const engine: CityEngine = createEngine(containerRef.current)
-    engine.init().then(() => setEngineReady(true))
+    engine.init().catch((error) => {
+      console.error("Unable to initialise the city", error)
+      setLoadError(true)
+    })
     return () => {
       engine.dispose()
     }
   }, [])
 
-  const startGame = () => {
-    getEngine()?.requestStart()
+  const startGame = (guided = false) => {
+    getEngine()?.requestStart(guided)
   }
 
+  if (loadError) return (
+    <div role="alert" className="fixed inset-0 flex items-center justify-center bg-[#0b1511] p-8 text-emerald-50">
+      <div className="max-w-lg"><h1 className="text-2xl font-bold">The 3D model could not start</h1><p className="my-4 text-emerald-100/70">Open this page in a browser with WebGL enabled, then reload. The separate presentation works without the model.</p><button onClick={() => window.location.reload()} className="rounded-lg bg-emerald-400 px-5 py-3 font-semibold text-emerald-950">Try again</button></div>
+    </div>
+  )
+
   return (
-    <div className="fixed inset-0 bg-black overflow-hidden select-none" role="application" aria-label="Solheim walkable 3D city">
+    <div className="fixed inset-0 bg-black overflow-hidden select-none" role="application" aria-label="Solheim 2050 proposed pilot district for City D">
       <div ref={containerRef} className="absolute inset-0" />
 
       {/* vignette */}
       <div className="pointer-events-none absolute inset-0 shadow-[inset_0_0_180px_rgba(0,0,0,0.55)]" />
 
       {ready && <HUD />}
-      {ready && <Minimap />}
+      {ready && !trafficLab && <Minimap />}
 
-      {!started && ready && <IntroOverlay onStart={startGame} loading={false} progress={loadingProgress} />}
-      {!ready && <IntroOverlay onStart={startGame} loading progress={loadingProgress} />}
+      {!started && ready && <IntroOverlay onStart={startGame} onTrafficLab={() => getEngine()?.startTrafficLab()} loading={false} progress={loadingProgress} />}
+      {!ready && <IntroOverlay onStart={startGame} onTrafficLab={() => getEngine()?.startTrafficLab()} loading progress={loadingProgress} />}
 
       {paused && started && (
         <div className="absolute inset-0 z-40 flex items-center justify-center bg-black/60 backdrop-blur-sm">
           <div className="text-center">
             <h2 className="text-3xl font-bold text-emerald-100 mb-2">Paused</h2>
-            <p className="text-emerald-200/70 mb-6">The city keeps breathing while you rest.</p>
+            <p className="text-emerald-200/70 mb-6">Solheim 2050 · proposed pilot district</p>
             <button
               onClick={() => getEngine()?.resume()}
               className="rounded-lg bg-emerald-500 hover:bg-emerald-400 text-emerald-950 font-semibold px-8 py-3 transition-colors cursor-pointer"
             >
               Resume walking
             </button>
+            <div className="mt-4 flex flex-wrap justify-center gap-2">
+              <button onClick={() => getEngine()?.toggleTrafficLab()} className="rounded-lg border border-amber-300/40 px-4 py-2 text-sm text-amber-100">Traffic lab (P)</button>
+              <button onClick={() => { getEngine()?.previousTourStop(); getEngine()?.resume() }} className="rounded-lg border border-emerald-300/25 px-4 py-2 text-sm text-emerald-100">Previous location</button>
+              <button onClick={() => { getEngine()?.toggleTour(); getEngine()?.resume() }} className="rounded-lg border border-emerald-300/25 px-4 py-2 text-sm text-emerald-100">Next / start visit</button>
+              <button onClick={() => { getEngine()?.endTour(); getEngine()?.resume() }} className="rounded-lg border border-emerald-300/25 px-4 py-2 text-sm text-emerald-100">Explore freely</button>
+            </div>
             <p className="mt-4 text-xs text-emerald-200/50">Click the world or the button to recapture the mouse</p>
           </div>
         </div>
@@ -69,7 +86,7 @@ export default function CityExperience() {
 
       {/* touch controls: left thumb = joystick (drawn on the canvas area),
           right thumb buttons = jump / sprint / interact */}
-      {touch && started && !paused && (
+      {touch && started && !paused && !trafficLab && (
         <>
           <div className="pointer-events-none absolute bottom-8 left-8 z-30 h-28 w-28 rounded-full border-2 border-emerald-200/25 bg-emerald-950/30">
             <div className="absolute inset-0 flex items-center justify-center text-[10px] uppercase tracking-widest text-emerald-200/50">move</div>
@@ -114,6 +131,7 @@ export default function CityExperience() {
 
       <InfoPanel />
       <StatsPanel />
+      <TrafficLab />
 
       {toast && (
         <div className="absolute bottom-24 left-1/2 -translate-x-1/2 z-30 rounded-full bg-emerald-950/85 border border-emerald-400/30 px-5 py-2 text-emerald-100 text-sm shadow-lg animate-in fade-in">

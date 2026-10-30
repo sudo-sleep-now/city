@@ -8,22 +8,22 @@ export default function StatsPanel() {
   const show = useCityStore((s) => s.showStats)
   if (!show) return null
   const engine = getEngine()
-  const st = engine?.plan.stats
+  const st = engine?.plan?.stats
   if (!st) return null
 
   const fmt = (n: number) => n.toLocaleString('en-US')
 
   const sections: { title: string; rows: [string, string][] }[] = [
     {
-      title: 'People & land use',
+      title: 'Building-based estimates',
       rows: [
-        ['Population', fmt(st.population)],
+        ['Residents (assumed occupancy)', fmt(st.population)],
         ['Residents + jobs', fmt(st.population + st.jobs)],
         ['Area', `${st.areaKm2} km²`],
         ['Density', `${fmt(st.densityPerKm2)} / km²`],
         ['Buildings', fmt(st.buildings)],
         ['Residential units', fmt(st.residentialUnits)],
-        ['Jobs', fmt(st.jobs)],
+        ['Jobs (assumed capacity)', fmt(st.jobs)],
       ],
     },
     {
@@ -31,18 +31,18 @@ export default function StatsPanel() {
       rows: [
         ['Public green space', `${fmt(st.greenAreaM2)} m²`],
         ['Share of city area', `${st.greenPercent} %`],
-        ['Avg. walk to a park', `${st.avgDistanceToParkM} m`],
-        ['Residents < 300 m from green', `${Math.round(st.residentsWithin300mPark * 100)} %`],
+        ['Avg. straight-line distance to a park', `${st.avgDistanceToParkM} m`],
+        ['Model residents < 300 m from green', `${Math.round(st.residentsWithin300mPark * 100)} %`],
       ],
     },
     {
-      title: 'Getting around',
+      title: 'Distance proxies, not walking routes',
       rows: [
-        ['Avg. walk to transit', `${st.avgDistanceToTransitM} m`],
-        ['Residents < 400 m from transit', `${Math.round(st.residentsWithin400mTransit * 100)} %`],
-        ['Residents < 500 m from a school', `${Math.round(st.residentsWithin500mSchool * 100)} %`],
+        ['Avg. straight-line distance to a stop', `${st.avgDistanceToTransitM} m`],
+        ['Model residents < 400 m from a stop', `${Math.round(st.residentsWithin400mTransit * 100)} %`],
+        ['Model residents < 500 m from a school', `${Math.round(st.residentsWithin500mSchool * 100)} %`],
         ['Transit stops', `${st.transitStops} (${st.tramStops} tram)`],
-        ['Modal share (est.)', `🚶 ${st.dailyTripsByMode.walk}% · 🚲 ${st.dailyTripsByMode.bike}% · 🚊 ${st.dailyTripsByMode.transit}% · 🚗 ${st.dailyTripsByMode.car}%`],
+        ['Travel behaviour', 'Not predicted by this model'],
       ],
     },
     {
@@ -62,8 +62,8 @@ export default function StatsPanel() {
       <div className="w-full max-w-3xl max-h-[88vh] overflow-y-auto rounded-2xl border border-emerald-500/25 bg-[#0d1712]/95 p-6 shadow-2xl">
         <div className="flex items-center justify-between mb-5">
           <div>
-            <h2 className="text-2xl font-bold text-emerald-50">Solheim by the numbers</h2>
-            <p className="text-xs text-emerald-300/60 mt-1">All values computed from the generated city plan — nothing is faked.</p>
+            <h2 className="text-2xl font-bold text-emerald-50">Pilot district: model estimates</h2>
+            <p className="text-xs text-emerald-300/60 mt-1">Geometry and capacity estimates for this 1.44 km² district. These are not survey results or forecasts for the wider city.</p>
           </div>
           <button
             onClick={() => getEngine()?.interact()}
@@ -72,6 +72,7 @@ export default function StatsPanel() {
             Close (Tab)
           </button>
         </div>
+        <p className="mb-5 rounded-lg border border-amber-400/20 bg-amber-900/15 p-3 text-xs leading-relaxed text-amber-100/75">Distances use straight lines from building centres, weighted by residential units. They do not include crossings, entrances, hills or accessibility barriers. Occupancy and jobs use design assumptions. Service frequency, travel costs and emissions are not simulated.</p>
         <div className="grid md:grid-cols-2 gap-4">
           {sections.map((sec) => (
             <div key={sec.title} className="rounded-xl border border-emerald-800/50 bg-emerald-900/20 overflow-hidden">

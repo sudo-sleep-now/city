@@ -1,0 +1,129 @@
+{
+  "scope": "Static world camera-pass submission at 16:9; excludes shadows, moving traffic and rasterisation. Not measured low-end FPS.",
+  "chunkCount": 992,
+  "partitionMs": 26,
+  "overview": {
+    "before": {
+      "triangles": 7788432,
+      "calls": 1113
+    },
+    "after": {
+      "triangles": 7788432,
+      "calls": 1113
+    }
+  },
+  "results": [
+    {
+      "view": "The proposal: a pilot district for City D",
+      "before": {
+        "triangles": 7738728,
+        "calls": 619
+      },
+      "high": {
+        "triangles": 3527095,
+        "calls": 958
+      },
+      "performance": {
+        "triangles": 2939234,
+        "calls": 800
+      },
+      "triangleReductionPercent": 62
+    },
+    {
+      "view": "Everyday life in Solheim Square",
+      "before": {
+        "triangles": 7698197,
+        "calls": 437
+      },
+      "high": {
+        "triangles": 3317654,
+        "calls": 753
+      },
+      "performance": {
+        "triangles": 2723373,
+        "calls": 577
+      },
+      "triangleReductionPercent": 65
+    },
+    {
+      "view": "Outer connections: reliable buses first",
+      "before": {
+        "triangles": 4118033,
+        "calls": 123
+      },
+      "high": {
+        "triangles": 956750,
+        "calls": 137
+      },
+      "performance": {
+        "triangles": 956750,
+        "calls": 137
+      },
+      "triangleReductionPercent": 77
+    },
+    {
+      "view": "The interchange: buses arrive, board and depart",
+      "before": {
+        "triangles": 7703047,
+        "calls": 431
+      },
+      "high": {
+        "triangles": 3023060,
+        "calls": 724
+      },
+      "performance": {
+        "triangles": 2559043,
+        "calls": 595
+      },
+      "triangleReductionPercent": 67
+    },
+    {
+      "view": "Safer short trips: the school route",
+      "before": {
+        "triangles": 7681719,
+        "calls": 205
+      },
+      "high": {
+        "triangles": 2531637,
+        "calls": 423
+      },
+      "performance": {
+        "triangles": 2367663,
+        "calls": 380
+      },
+      "triangleReductionPercent": 69
+    },
+    {
+      "view": "Local services: fewer trips across town",
+      "before": {
+        "triangles": 7746179,
+        "calls": 525
+      },
+      "high": {
+        "triangles": 3573042,
+        "calls": 879
+      },
+      "performance": {
+        "triangles": 2702605,
+        "calls": 677
+      },
+      "triangleReductionPercent": 65
+    },
+    {
+      "view": "The trade-off: road space and fair access",
+      "before": {
+        "triangles": 7683233,
+        "calls": 409
+      },
+      "high": {
+        "triangles": 3529238,
+        "calls": 729
+      },
+      "performance": {
+        "triangles": 2792376,
+        "calls": 548
+      },
+      "triangleReductionPercent": 64
+    }
+  ]
+}

@@ -18,6 +18,7 @@ export default function Minimap() {
     const engine = getEngine()
     if (!engine) return
     const plan = engine.plan
+    if (!plan) return
     const cv = canvasRef.current
     const ctx = cv.getContext('2d')!
     const S = cv.width // square
@@ -49,7 +50,19 @@ export default function Minimap() {
         }
         ctx.stroke()
       }
-      // tram lines
+      // Bus routes connect the pilot to edge transfer points.
+      for (const rt of plan.routes) {
+        if (rt.mode !== 'bus') continue
+        ctx.strokeStyle = '#eab44f'
+        ctx.lineWidth = 1.4
+        ctx.beginPath()
+        rt.points.forEach((p, i) => {
+          if (i === 0) ctx.moveTo(tx(p.x), tz(p.z))
+          else ctx.lineTo(tx(p.x), tz(p.z))
+        })
+        ctx.stroke()
+      }
+      // tram lines (possible later phase)
       ctx.strokeStyle = '#c2410c'
       ctx.lineWidth = 1
       ctx.setLineDash([3, 2])
@@ -92,7 +105,8 @@ export default function Minimap() {
   return (
     <div className="absolute right-4 top-4 z-20 rounded-lg overflow-hidden border border-white/15 shadow-lg">
       <canvas ref={canvasRef} width={176} height={176} className="block" />
-      <div className="absolute bottom-1 right-1.5 text-[9px] text-white/50">Solheim · 1.2 × 1.2 km</div>
+      <div className="absolute left-1.5 top-1 text-[9px] text-amber-200/90">Bus routes / dashed: future tram</div>
+      <div className="absolute bottom-1 right-1.5 text-[9px] text-white/50">Pilot · 1.2 × 1.2 km</div>
     </div>
   )
 }

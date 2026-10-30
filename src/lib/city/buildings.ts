@@ -1,6 +1,9 @@
 import * as THREE from 'three'
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js'
 import { getStorefrontMaterial, tintGeo } from './materials'
+import { createAuthoredBuildings } from './authored-buildings'
+import { createStation, createStationForecourt } from './station'
+import type { ModelLibrary } from './models'
 import type { AABB, BuildingSpec, CityMaterials, CityPlan, EnterableSpec } from './types'
 
 /* ============================================================
@@ -58,9 +61,11 @@ function place(geo: THREE.BufferGeometry, rotY: number, x: number, y: number, z:
   return geo
 }
 
-export function createBuildings(plan: CityPlan, mats: CityMaterials): BuildingsResult {
+export function createBuildings(plan: CityPlan, mats: CityMaterials, models: ModelLibrary = new Map()): BuildingsResult {
   const group = new THREE.Group()
   const extraColliders: AABB[] = []
+  const authored = createAuthoredBuildings(plan, models, mats)
+  group.add(authored.group)
   const rng = mulberry32(777)
 
   // ---- collect wall geometries per material bucket ----
@@ -104,6 +109,7 @@ export function createBuildings(plan: CityPlan, mats: CityMaterials): BuildingsR
   const mullionMat = new THREE.MeshBasicMaterial({ color: '#6f7873' })
 
   for (const b of plan.buildings) {
+    if (authored.replaced.has(b.id)) continue
     const rot = (b.rotation * Math.PI) / 180
     const isGlass = b.kind === 'office' && b.floors >= 14
     const fm = mats.facades[b.facadeVariant % mats.facades.length]
@@ -666,9 +672,9 @@ export function createBuildings(plan: CityPlan, mats: CityMaterials): BuildingsR
 
   // ---- special buildings ----
   // (label OR special archetype — e.g. the unlabeled hospital helipad tower)
-  const specials = plan.buildings.filter((b) => b.label || b.kind === 'hospital')
+  const specials = plan.buildings.filter((b) => !authored.replaced.has(b.id) && (b.label || b.kind === 'hospital'))
   for (const b of specials) {
-    buildSpecial(group, b, mats, extraColliders, rng)
+    buildSpecial(group, b, mats, extraColliders, rng, models)
   }
 
   // ---- doors for enterables ----
@@ -683,7 +689,7 @@ export function createBuildings(plan: CityPlan, mats: CityMaterials): BuildingsR
 
 /* ---------------- special buildings ---------------- */
 
-function buildSpecial(group: THREE.Group, b: BuildingSpec, mats: CityMaterials, colliders: AABB[], rng: () => number) {
+function buildSpecial(group: THREE.Group, b: BuildingSpec, mats: CityMaterials, colliders: AABB[], rng: () => number, models: ModelLibrary) {
   const rot = (b.rotation * Math.PI) / 180
   const g = new THREE.Group()
   g.position.set(b.x, 0, b.z)
@@ -749,62 +755,12 @@ function buildSpecial(group: THREE.Group, b: BuildingSpec, mats: CityMaterials, 
 
   switch (b.kind) {
     case 'transit-hub': {
-      // stone walls + barrel roof
-      shell(W, H - 2, D, 0, (H - 2) / 2, 0, mats.specialFacade('hub'))
-      const vault = new THREE.Mesh(new THREE.CylinderGeometry(D / 2, D / 2, W, 16, 1, false, 0, Math.PI), mats.metal)
-      vault.rotation.z = Math.PI / 2
-      vault.position.y = H - 2
-      vault.castShadow = true
-      g.add(vault)
-      // lit hall glazing — warm glowing wall + mullions read as the station interior
-      // (every layer at its own depth: wall 0 · glow +0.04 · mullions +0.09 · portal +0.22)
-      const glow = new THREE.Mesh(
-        new THREE.PlaneGeometry(W * 0.7, 5.6),
-        new THREE.MeshStandardMaterial({ color: '#a8875c', emissive: '#ffd9a0', emissiveIntensity: 1.15, roughness: 0.5 }),
-      )
-      glow.position.set(0, 2.8, D / 2 + 0.04)
-      g.add(glow)
-      for (let i = -3; i <= 3; i++) {
-        const mul = new THREE.Mesh(new THREE.BoxGeometry(0.18, 5.6, 0.1), mats.metalDark)
-        mul.position.set((i * W * 0.7) / 7, 2.8, D / 2 + 0.09)
-        g.add(mul)
-      }
-      const transom = new THREE.Mesh(new THREE.BoxGeometry(W * 0.7, 0.16, 0.1), mats.metalDark)
-      transom.position.set(0, 4.4, D / 2 + 0.09)
-      g.add(transom)
-      // entrance portal (aligns with the enterable door; sits proud of the glow wall)
-      const portal = new THREE.Mesh(new THREE.BoxGeometry(4.6, 3.2, 0.22), mats.glassDark)
-      portal.position.set(0, 1.6, D / 2 + 0.22)
-      g.add(portal)
-      // canopy + warm wall lamps over the entrance
-      const can = new THREE.Mesh(new THREE.BoxGeometry(9, 0.28, 2.6), mats.metalDark)
-      can.position.set(0, 3.8, D / 2 + 1.2)
-      can.castShadow = true
-      g.add(can)
-      for (const lx of [-3.4, 3.4]) {
-        const lamp = new THREE.Mesh(
-          new THREE.BoxGeometry(0.5, 0.18, 0.18),
-          new THREE.MeshStandardMaterial({ color: '#e8dfc8', emissive: '#ffca7a', emissiveIntensity: 1.2 }),
-        )
-        lamp.position.set(lx, 3.35, D / 2 + 0.14)
-        g.add(lamp)
-      }
-      // columns
-      for (const i of [-2, -1, 1, 2]) cyl(0.4, H - 2, i * 12, (H - 2) / 2, D / 2 + 1, mats.metalDark, 8)
-      mural('CENTRAL STATION', 'hub', 16, 2.2, 0, H - 0.5, D / 2 + 0.3)
-      // clock (well clear of the wall and of the hour hand)
-      const clock = new THREE.Mesh(new THREE.CircleGeometry(1.2, 24), mats.white)
-      clock.position.set(0, H - 3.4, D / 2 + 0.12)
-      g.add(clock)
-      const hand = new THREE.Mesh(new THREE.BoxGeometry(0.12, 1.0, 0.05), mats.black)
-      hand.position.set(0, H - 3.2, D / 2 + 0.22)
-      g.add(hand)
-      // flags
-      for (const fx of [-W / 2 + 3, W / 2 - 3]) {
-        cyl(0.07, 9, fx, 4.5, D / 2 + 1.5, mats.metal, 6)
-        const flag = new THREE.Mesh(new THREE.PlaneGeometry(1.6, 1), mats.fabricGreen)
-        flag.position.set(fx + 0.85, 8.2, D / 2 + 1.64)
-        g.add(flag)
+      const station = createStation(b, mats, models)
+      g.add(station.group, createStationForecourt(mats, models))
+      for (const c of station.colliders) {
+        const corners = [[c.minX, c.minZ], [c.minX, c.maxZ], [c.maxX, c.minZ], [c.maxX, c.maxZ]]
+          .map(([x, z]) => new THREE.Vector3(x, 0, z).applyAxisAngle(new THREE.Vector3(0, 1, 0), rot))
+        colliders.push({ minX: b.x + Math.min(...corners.map(v => v.x)), maxX: b.x + Math.max(...corners.map(v => v.x)), minZ: b.z + Math.min(...corners.map(v => v.z)), maxZ: b.z + Math.max(...corners.map(v => v.z)), h: c.h })
       }
       break
     }
@@ -866,11 +822,20 @@ function buildSpecial(group: THREE.Group, b: BuildingSpec, mats: CityMaterials, 
       }
       mural('MARKET HALL', 'market', 14, 2, 0, H - 3.6, D / 2 + 0.2)
       // awning
-      const awn = new THREE.Mesh(new THREE.BoxGeometry(W * 0.7, 0.15, 2.4), mats.fabricRed)
-      awn.position.set(0, 4.8, D / 2 + 1.1)
+      const marketGreen = new THREE.MeshStandardMaterial({ color: '#395e51', roughness: .55, metalness: .25 })
+      const awn = new THREE.Mesh(new THREE.BoxGeometry(W * .94, 0.15, 3.2), marketGreen)
+      awn.position.set(0, 4.8, D / 2 + 1.35)
       awn.rotation.x = 0.18
       awn.castShadow = true
       g.add(awn)
+      // A continuous sheltered frontage gives the market a civic address and
+      // leaves the broad entrance axis open between the two central columns.
+      box(W * .94, .14, .20, 0, 4.46, D / 2 + 2.8, marketGreen)
+      for (const x of [-24, -16, -8, 8, 16, 24]) {
+        box(.18, 4.5, .18, x, 2.25, D / 2 + 2.8, marketGreen)
+        colliders.push({ minX: b.x + x - .12, maxX: b.x + x + .12, minZ: b.z + D / 2 + 2.68, maxZ: b.z + D / 2 + 2.92, h: 4.5 })
+      }
+      sign('LOCAL FOOD  ·  FLOWERS  ·  EVERYDAY GOODS', 18, .65, 0, 4.05, D / 2 + 2.92, { bg: '#2b483d', fg: '#f3e7c9' })
       break
     }
     case 'hospital': {
@@ -1022,7 +987,7 @@ function buildSpecial(group: THREE.Group, b: BuildingSpec, mats: CityMaterials, 
       // café / grocery handled mostly by storefront band; add labels + awnings
       shell(W, H, D, 0, H / 2, 0, mats.specialFacade('retail'))
       if (b.label) {
-        mural(b.label, 'retail', Math.min(W * 0.85, 12), 1.2, 0, Math.min(H - 0.6, 4.4), D / 2 + 0.15)
+        mural(b.label, 'retail', Math.min(W * 0.85, 12), 1.2, 0, Math.min(H - 0.6, 4.4), D / 2 + 0.19)
         const awn = new THREE.Mesh(new THREE.BoxGeometry(W * 0.8, 0.12, 1.6), mats.fabricGreen)
         awn.position.set(0, 3.4, D / 2 + 0.7)
         awn.rotation.x = 0.2

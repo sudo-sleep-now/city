@@ -1,0 +1,18 @@
+{
+  "source": "scripts/blender/civic.py",
+  "editable_scene": "assets/blender/civic.blend",
+  "export": "public/models/civic.glb",
+  "bytes": 890316,
+  "sha256": "feb5ecd21f8e6bc0bf5b675e7ff3b321ba980c33c63cfd3f0459e9e8e845e08d",
+  "triangles": 15934,
+  "triangles_by_root": {
+    "civic_clock": 4496,
+    "civic_fountain": 7028,
+    "market_kiosk": 4410
+  },
+  "mesh_batches": 23,
+  "materials": 12,
+  "textures": 0,
+  "has_normals": true,
+  "compression_extensions": []
+}

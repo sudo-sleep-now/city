@@ -1,8 +1,11 @@
 import * as THREE from 'three'
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js'
-import { GARBAGE_SPOTS, MAX_BUSES, MAX_CARS, MAX_TRAMS } from './constants'
+import { GARBAGE_SPOTS, MAX_BUSES, MAX_TRAMS } from './constants'
+import { MAX_TRAFFIC_VEHICLES, MIN_TRAFFIC_VEHICLES, TRAFFIC_PRESETS, type TrafficConfig, type TrafficMetrics } from './traffic-config'
 import { canvas, tex } from './materials'
-import type { CityMaterials, CityPlan, ConnPath, RoadNetworkData, SignalGroup } from './types'
+import { TrafficRouter } from './traffic-routing'
+import { headlampAnchors, type HeadlampEmitter } from './vehicle-lights'
+import type { CityMaterials, CityPlan, ConnPath, LaneSeg, RoadNetworkData, SignalGroup } from './types'
 
 /* ============================================================
  * TrafficSystem — signalized intersections, realistic multi-part
@@ -145,7 +148,8 @@ function buildGarbageTruckGroups(): VehicleGroups {
   g.paint.push(
     vBox(W, 1.6, 1.9, 0, 1.6, L / 2 - 1.05), // cab
     vBox(W * 0.94, 0.4, 0.9, 0, 2.5, L / 2 - 1.2, 0.3), // roof deflector
-    vBox(W * 0.92, 2.0, L * 0.52, 0, 1.85, -L * 0.19), // packer body
+    // The separately textured packer body is added by buildCars. A second
+    // identical box here used to fight it on every visible face.
     vBox(W * 0.88, 0.5, 2.0, 0, 1.15, L / 2 - 3.1, 0.35), // hopper trough (sloped)
   )
   g.glass.push(
@@ -167,6 +171,48 @@ function buildGarbageTruckGroups(): VehicleGroups {
 
 const CAR_BODY_BUILDERS: (() => VehicleGroups)[] = [buildSedanGroups, buildSedanGroups, buildVanGroups, buildTruckGroups, buildGarbageTruckGroups]
 const CAR_TYPE_WEIGHTS = [0, 0, 0, 1, 2, 3, 4] // sedan ×3, taxi, van, truck, garbage truck
+
+/** Convert the Blender-authored mesh children into the same small material buckets
+ * used by the instanced traffic renderer. Meshes are flattened relative to the
+ * named model root, keeping the imported asset out of the scene graph per car. */
+function authoredVehicleGroups(model: THREE.Group, wheelOffsets: VehicleGroups['wheelOffsets']): VehicleGroups {
+  const groups = newGroups()
+  groups.wheelOffsets = wheelOffsets
+  const buckets: Record<string, THREE.BufferGeometry[]> = {
+    paint: groups.paint, glass: groups.glass, dark: groups.dark,
+    chrome: groups.chrome, lampF: groups.lampF, lampR: groups.lampR,
+    tire: groups.tire, hub: groups.hub,
+  }
+  model.updateMatrixWorld(true)
+  const inverseRoot = model.matrixWorld.clone().invert()
+  model.traverse((node) => {
+    const mesh = node as THREE.Mesh
+    if (!mesh.isMesh) return
+    const prefix = mesh.name.split('_', 1)[0]
+    let target = buckets[prefix]
+    // A multi-material GLB mesh loads as a named Group containing primitive
+    // meshes. Its material-bucket prefix belongs to that parent group.
+    let parent = mesh.parent
+    while (!target && parent && parent !== model) {
+      target = buckets[parent.name.split('_', 1)[0]]
+      parent = parent.parent
+    }
+    if (!target) return
+    const geometry = mesh.geometry.clone()
+    geometry.applyMatrix4(inverseRoot.clone().multiply(mesh.matrixWorld))
+    // mergeGeometries requires matching indexed state and attributes.
+    const flat = geometry.index ? geometry.toNonIndexed() : geometry
+    for (const attr of Object.keys(flat.attributes)) {
+      if (!['position', 'normal', 'uv'].includes(attr)) flat.deleteAttribute(attr)
+    }
+    if (!flat.getAttribute('normal')) flat.computeVertexNormals()
+    if (!flat.getAttribute('uv')) {
+      flat.setAttribute('uv', new THREE.Float32BufferAttribute(new Float32Array(flat.getAttribute('position').count * 2), 2))
+    }
+    target.push(flat)
+  })
+  return groups
+}
 
 const cargoSideCanvas = (): HTMLCanvasElement => {
   const [c, ctx] = canvas(256, 128)
@@ -203,7 +249,15 @@ interface CarState {
   /** intersection connector being traversed (null = on a normal piece) */
   conn: ConnPath | null
   connNext: string
+  plannedNext: string | null
+  afterPocket: string | null
+  homeNode: string
+  tripTarget: string
+  nextTripTarget: string | null
+  tripToHome: boolean
   connDist: number
+  /** Keep the rear reserved briefly after the centre reaches the exit lane. */
+  tail: ConnPath | null
   stuck: number // seconds at ~zero speed
   creep: number // >0 while ignoring right-of-way after a long wait
   jammed: number // accumulated seconds without progress (decays slowly when moving)
@@ -211,6 +265,8 @@ interface CarState {
   /** garbage truck: dumpster service countdown + cooldown */
   serveT: number
   serveCd: number
+  /** Brief hold avoids flicker during tiny speed corrections; held at a stop. */
+  brakeHold: number
 }
 
 interface BusState {
@@ -222,6 +278,7 @@ interface BusState {
   z: number
   heading: number
   doorT: number // 0 closed .. 1 open (eased)
+  brakeHold: number
 }
 
 interface TramState {
@@ -270,38 +327,81 @@ export class TrafficSystem {
   private cars: CarState[] = []
   private buses: BusState[] = []
   private trams: TramState[] = []
-  private signalState = new Map<string, { phase: number; t: number }>()
-  private signalMeshes: { lampIM: THREE.InstancedMesh | null; heads: { x: number; y: number; z: number }[] }[] = []
+  private signalState = new Map<string, { phase: number; t: number; elapsed: number; gap: number }>()
+  private laneSignals = new Map<string, SignalGroup>()
+  private signalMeshes: { lampIM: THREE.InstancedMesh | null; arrowIM: THREE.InstancedMesh; heads: { x: number; y: number; z: number }[] }[] = []
   private laneList: string[] = []
   private busPaths: { pts: { x: number; z: number }[]; cum: number[]; total: number; stopDists: number[]; stopIds: string[] }[] = []
   private tramPaths: { axis: 'x' | 'z'; coord: number; from: number; to: number; len: number; stops: number[] }[] = []
   private carMeshes: CarTypeMeshes[] = []
+  private carOwnedMaterials = new Set<THREE.Material>()
   private busMeshes: BusMeshes | null = null
   private busDoorZ: number[] = [4.5, -1.6] // painted door centers along the bus (local z)
   private busW = 2.55
   private playerX = 0
   private playerZ = 0
-  private rng = (() => {
-    let s = 90210
-    return () => {
-      s = (s * 1103515245 + 12345) & 0x7fffffff
-      return s / 0x7fffffff
-    }
-  })()
+  private rng = this.makeRng(90210)
+  private config: TrafficConfig = { ...TRAFFIC_PRESETS.normal }
+  private mats!: CityMaterials
+  private models?: Map<string, THREE.Group>
+  private simTime = 0
+  private completedSegments = 0
+  private recoveryRespawns = 0
+  private speedIntegral = 0
+  private speedWindow: { dt: number; integral: number }[] = []
+  private speedWindowHead = 0
+  private speedWindowTime = 0
+  private speedWindowIntegral = 0
+  private minCurrentSpeed = Infinity
+  private minRunSpeed = Infinity
+  private minRollingSpeed = Infinity
+  private stoppedVehicleSeconds = 0
+  private metricTime = 0
+  private transitionTimes: number[] = []
+  private activeConnectors = new Set<CarState>()
+  private conflictCache = new WeakMap<ConnPath, WeakMap<ConnPath, number>>()
+  private pathSamples = new WeakMap<ConnPath, { x: number; z: number; d: number }[]>()
+  private railCrossings = new WeakMap<ConnPath, Map<string, { lo: number; hi: number } | null>>()
+  private router: TrafficRouter
+  private centralCredit = 0
+  private inboundDepartures = 0
+  private centralDepartures = 0
+  private completedTrips = 0
+  private completedReturns = 0
+  private lightNight = 0
+  private headTint = new THREE.Color()
+  private tailTint = new THREE.Color()
+  private paintTints = ['#c94f3d', '#d8d4cc', '#5b7461', '#9a9da1', '#d8a832', '#3f4a42'].map(hex => new THREE.Color(hex))
 
-  constructor(plan: CityPlan, network: RoadNetworkData, mats: CityMaterials) {
+  private makeRng(seed: number) {
+    let s = seed | 0
+    return () => { s = (s * 1103515245 + 12345) & 0x7fffffff; return s / 0x7fffffff }
+  }
+
+  constructor(plan: CityPlan, network: RoadNetworkData, mats: CityMaterials, models?: Map<string, THREE.Group>) {
     this.plan = plan
     this.network = network
+    this.router = new TrafficRouter(network)
+    this.mats = mats
+    this.models = models
+    for (const lane of network.lanes.values()) {
+      const signal = lane.signalId ? network.signals.find(s => s.id === lane.signalId)
+        : !lane.routeChoices ? network.signals.find(s => Math.hypot(s.x - lane.x2, s.z - lane.z2) < 14) : undefined
+      if (signal) this.laneSignals.set(lane.id, signal)
+    }
     this.buildSignals(mats)
-    this.buildCars(mats)
+    this.buildCars(mats, models)
+    this.initializeTrips()
+    this.updateCars(0, 0)
     this.buildBuses(mats)
     this.buildTrams(mats)
+    this.updateLightAppearance(0)
   }
 
   /* ---------------- signals ---------------- */
   private buildSignals(mats: CityMaterials) {
     for (const sg of this.network.signals) {
-      this.signalState.set(sg.id, { phase: 0, t: sg.phases[0]?.duration ?? 9 })
+      this.signalState.set(sg.id, { phase: 0, t: sg.phases[0]?.duration ?? 9, elapsed: 0, gap: 0 })
     }
     if (this.network.signals.length === 0) return
     // poles + mast arms + heads (heads face the ONCOMING traffic they control)
@@ -312,6 +412,12 @@ export class TrafficSystem {
     const headIM = new THREE.InstancedMesh(headGeo, mats.metalDark, this.network.signals.length * 4)
     const lampGeo = new THREE.SphereGeometry(0.12, 8, 6)
     const lampIM = new THREE.InstancedMesh(lampGeo, new THREE.MeshBasicMaterial({ color: '#ffffff', toneMapped: false }), this.network.signals.length * 12)
+    const arrowShape = new THREE.Shape([
+      new THREE.Vector2(-0.23, 0), new THREE.Vector2(-0.03, 0.19), new THREE.Vector2(-0.03, 0.07),
+      new THREE.Vector2(0.22, 0.07), new THREE.Vector2(0.22, -0.07), new THREE.Vector2(-0.03, -0.07), new THREE.Vector2(-0.03, -0.19),
+    ])
+    const arrowIM = new THREE.InstancedMesh(new THREE.ShapeGeometry(arrowShape), new THREE.MeshBasicMaterial({ color: '#ffffff', toneMapped: false }), this.network.signals.length * 4)
+    const arrowBackIM = new THREE.InstancedMesh(new THREE.BoxGeometry(0.55, 0.5, 0.28), mats.metalDark, this.network.signals.length * 4)
     const dummy = new THREE.Object3D()
     let i = 0
     let li = 0
@@ -344,6 +450,17 @@ export class TrafficSystem {
         // lamps on the face the approaching drivers see
         const nx = Math.sin(ry)
         const nz = Math.cos(ry)
+        const hasArrow = sg.phases.some(p => p.movement === 'left' && p.greenAxis === h.axis)
+        dummy.position.set(hx - Math.cos(ry) * 0.55, 5.55, hz + Math.sin(ry) * 0.55)
+        dummy.scale.setScalar(hasArrow ? 1 : 0.0001)
+        dummy.updateMatrix()
+        arrowBackIM.setMatrixAt(i, dummy.matrix)
+        dummy.position.x += nx * 0.15
+        dummy.position.z += nz * 0.15
+        dummy.updateMatrix()
+        arrowIM.setMatrixAt(i, dummy.matrix)
+        arrowIM.setColorAt(i, new THREE.Color('#123a16'))
+        dummy.scale.setScalar(1)
         for (let l = 0; l < 3; l++) {
           dummy.position.set(hx + nx * 0.17, 5.9 - l * 0.32, hz + nz * 0.17)
           dummy.updateMatrix()
@@ -359,9 +476,11 @@ export class TrafficSystem {
     armIM.instanceMatrix.needsUpdate = true
     headIM.instanceMatrix.needsUpdate = true
     lampIM.instanceMatrix.needsUpdate = true
+    arrowIM.instanceMatrix.needsUpdate = true
+    arrowBackIM.instanceMatrix.needsUpdate = true
     if (lampIM.instanceColor) lampIM.instanceColor.needsUpdate = true
-    this.group.add(poleIM, armIM, headIM, lampIM)
-    this.signalMeshes.push({ lampIM, heads })
+    this.group.add(poleIM, armIM, headIM, lampIM, arrowIM, arrowBackIM)
+    this.signalMeshes.push({ lampIM, arrowIM, heads })
   }
 
   signalGreenAxis(signalId: string): 'x' | 'z' | null {
@@ -370,64 +489,281 @@ export class TrafficSystem {
     const st = this.signalState.get(signalId)
     if (!st) return null
     const phase = sg.phases[st.phase]
-    return phase ? phase.greenAxis : null
+    return st.t > 0 && phase && phase.movement !== 'left' ? phase.greenAxis : null
   }
 
   private updateSignals(dt: number) {
+    const demand = new Map<string, Record<string, number>>()
+    if (this.config.signalPolicy === 'adaptive') {
+      for (const car of this.cars) {
+        if (car.conn && !car.conn.internal) continue
+        const lane = this.network.lanes.get(car.conn?.internal ? car.connNext : car.segId)
+        const signal = lane ? this.laneSignals.get(lane.id) : undefined
+        if (!signal || !lane) continue
+        const remaining = car.conn ? car.conn.len - car.connDist + Math.hypot(lane.x2 - lane.x1, lane.z2 - lane.z1)
+          : Math.hypot(lane.x2 - lane.x1, lane.z2 - lane.z1) - car.dist
+        if (remaining > 45) continue
+        if (car.conn && remaining / Math.max(4, car.speed) > 4) continue
+        // A full downstream lane cannot use a green. Count approaching traffic
+        // as well as queues, with extra weight for cars that have waited.
+        if (car.plannedNext && !this.exitClear(car, car.plannedNext)) continue
+        let queue = demand.get(signal.id)
+        if (!queue) demand.set(signal.id, queue = {})
+        const axis = Math.abs(lane.x2 - lane.x1) > Math.abs(lane.z2 - lane.z1) ? 'x' : 'z'
+        const key = `${axis}:${lane.pocket === 'left' ? 'left' : 'through'}`
+        queue[key] = (queue[key] ?? 0) + (car.conn ? 0.5 : 1) + Math.min(car.stuck, 20) * 0.2
+      }
+    }
     for (const sg of this.network.signals) {
       const st = this.signalState.get(sg.id)
       if (!st) continue
       const phase = sg.phases[st.phase]
       if (!phase) continue
-      st.t -= dt
+      if (st.t > 0 && this.config.signalPolicy === 'adaptive') {
+        st.elapsed += dt
+        const queue = demand.get(sg.id) ?? {}
+        const key = `${phase.greenAxis}:${phase.movement ?? 'through'}`
+        const current = (queue[key] ?? 0) + (phase.movement !== 'left' ? (queue[`${phase.greenAxis}:left`] ?? 0) * 0.5 : 0)
+        const opposing = Object.entries(queue).reduce((sum, [other, n]) => sum + (other.split(':')[0] !== phase.greenAxis ? n : 0), 0)
+        st.gap = current === 0 ? st.gap + dt : 0
+        // Short minimum greens discharge a platoon. Gap out unused greens;
+        // switch earlier for other queues. Bounded greens and regular through
+        // phases guarantee service to pedestrians and quiet approaches.
+        const minGreen = phase.movement === 'left' ? 3.5 : 4.5
+        const maxGreen = phase.movement === 'left' ? 7 : sg.phases.some(p => p.movement === 'left') ? 11 : 15
+        const release = st.elapsed >= minGreen && (st.gap >= 1.2
+          || (st.elapsed >= minGreen + 2 && opposing > Math.max(1, current * 1.5)))
+        st.t = release || st.elapsed >= maxGreen ? 0 : maxGreen - st.elapsed
+      } else st.t -= dt
       if (st.t <= -1.6) {
-        // 1.6s all-red after each green
+        // Preserve the all-red clearance between every pair of greens.
         st.phase = (st.phase + 1) % sg.phases.length
+        if (this.config.signalPolicy === 'adaptive') {
+          // An empty turn pocket needs no arrow phase. Through phases still
+          // run regularly for pedestrian crossings and quiet side streets.
+          for (let i = 0; i < sg.phases.length; i++) {
+            const next = sg.phases[st.phase]
+            if (next.movement !== 'left' || (demand.get(sg.id)?.[`${next.greenAxis}:left`] ?? 0) > 0) break
+            st.phase = (st.phase + 1) % sg.phases.length
+          }
+        }
         st.t = sg.phases[st.phase].duration
+        st.elapsed = st.gap = 0
       }
     }
   }
 
-  private isGreen(sg: SignalGroup, axis: 'x' | 'z'): boolean {
+  private recordMetrics(dt: number) {
+    this.simTime += dt
+    if (dt <= 0 || !this.cars.length) return
+    let speed = 0, queued = 0
+    for (const c of this.cars) {
+      speed += c.speed
+      if (c.speed < 0.5) queued++
+    }
+    const n = this.cars.length
+    this.metricTime += dt
+    this.speedIntegral += speed / n * dt
+    this.stoppedVehicleSeconds += queued * dt
+    const integral = speed / n * dt
+    this.speedWindow.push({ dt, integral })
+    this.speedWindowTime += dt
+    this.speedWindowIntegral += integral
+    while (this.speedWindowTime > 60 && this.speedWindowHead < this.speedWindow.length) {
+      const first = this.speedWindow[this.speedWindowHead]
+      const excess = this.speedWindowTime - 60
+      if (first.dt <= excess + 1e-9) {
+        this.speedWindowTime -= first.dt
+        this.speedWindowIntegral -= first.integral
+        this.speedWindowHead++
+      } else {
+        const removed = first.integral * excess / first.dt
+        first.dt -= excess; first.integral -= removed
+        this.speedWindowIntegral -= removed; this.speedWindowTime = 60
+      }
+    }
+    if (this.speedWindowHead > 1024) {
+      this.speedWindow = this.speedWindow.slice(this.speedWindowHead)
+      this.speedWindowHead = 0
+    }
+    this.minCurrentSpeed = Math.min(this.minCurrentSpeed, speed / n * 3.6)
+    if (this.simTime >= 1) this.minRunSpeed = Math.min(this.minRunSpeed, this.speedIntegral / this.metricTime * 3.6)
+    if (this.speedWindowTime >= 60 - 1e-6) this.minRollingSpeed = Math.min(this.minRollingSpeed, this.speedWindowIntegral / this.speedWindowTime * 3.6)
+  }
+
+  getConfig(): TrafficConfig { return { ...this.config } }
+
+  getMetrics(): TrafficMetrics {
+    const n = this.cars.length
+    const elapsed = Math.max(this.metricTime, 1e-6)
+    while (this.transitionTimes.length && this.transitionTimes[0] <= this.simTime - 60) this.transitionTimes.shift()
+    const queued = this.cars.reduce((sum, c) => sum + (c.speed < 0.5 ? 1 : 0), 0)
+    return {
+      simulationSeconds: this.simTime,
+      avgSpeedKmh: n ? this.speedIntegral / elapsed * 3.6 : 0,
+      currentSpeedKmh: n ? this.cars.reduce((sum, car) => sum + car.speed, 0) / n * 3.6 : 0,
+      rollingSpeedKmh: this.speedWindowTime ? this.speedWindowIntegral / this.speedWindowTime * 3.6 : 0,
+      minCurrentSpeedKmh: Number.isFinite(this.minCurrentSpeed) ? this.minCurrentSpeed : null,
+      minRunSpeedKmh: Number.isFinite(this.minRunSpeed) ? this.minRunSpeed : null,
+      minRollingSpeedKmh: Number.isFinite(this.minRollingSpeed) ? this.minRollingSpeed : null,
+      queued,
+      queuePercent: n ? queued / n * 100 : 0,
+      meanWaitSec: queued ? this.cars.reduce((sum, c) => sum + (c.speed < 0.5 ? c.stuck : 0), 0) / queued : 0,
+      stoppedSecondsPerVehicle: n ? this.stoppedVehicleSeconds / n : 0,
+      throughputPerMinute: this.transitionTimes.length * 60 / Math.max(1, Math.min(60, this.simTime)),
+      completedSegments: this.completedSegments,
+      activeVehicles: n,
+      recoveryRespawns: this.recoveryRespawns,
+    }
+  }
+
+  configure(config: TrafficConfig): void {
+    const count = Math.round(Math.max(MIN_TRAFFIC_VEHICLES, Math.min(MAX_TRAFFIC_VEHICLES, config.vehicleCount)))
+    this.config = { scenario: config.scenario, vehicleCount: count, signalPolicy: config.signalPolicy }
+    this.cars = []
+    for (const meshes of this.carMeshes) {
+      for (const mesh of Object.values(meshes)) {
+        if (mesh instanceof THREE.InstancedMesh) {
+          this.group.remove(mesh)
+          mesh.geometry.dispose()
+        }
+      }
+    }
+    this.carMeshes = []
+    for (const material of this.carOwnedMaterials) {
+      const textured = material as THREE.MeshStandardMaterial
+      textured.map?.dispose()
+      material.dispose()
+    }
+    this.carOwnedMaterials.clear()
+    this.rng = this.makeRng(90210)
+    this.simTime = this.completedSegments = this.recoveryRespawns = 0
+    this.speedIntegral = this.metricTime = 0
+    this.speedWindow = []; this.speedWindowHead = 0
+    this.speedWindowTime = this.speedWindowIntegral = 0
+    this.minCurrentSpeed = this.minRunSpeed = this.minRollingSpeed = Infinity
+    this.stoppedVehicleSeconds = 0
+    this.transitionTimes = []
+    this.buildCars(this.mats, this.models)
+    this.initializeTrips()
+    for (const sg of this.network.signals) this.signalState.set(sg.id, { phase: 0, t: sg.phases[0]?.duration ?? 9, elapsed: 0, gap: 0 })
+    this.updateCars(0, 0) // render valid reset poses even while the experiment is paused
+    this.updateLightAppearance(this.lightNight)
+  }
+
+  private isGreen(sg: SignalGroup, axis: 'x' | 'z', lane?: LaneSeg): boolean {
     const st = this.signalState.get(sg.id)
     if (!st) return true
     if (st.t <= 0) return false // all-red
     const phase = sg.phases[st.phase]
-    return phase ? phase.greenAxis === axis : true
+    if (!phase) return true
+    if (phase.greenAxis !== axis) return false
+    if (phase.movement === 'left') return lane?.pocket === 'left'
+    // During a circular green left turns may use gaps, yielding through the
+    // conflict reservations. The separate arrow guarantees a protected turn.
+    return true
+  }
+
+  private newInboundTarget(car: CarState): string {
+    const share = this.config.scenario === 'gridlock' ? 0.92 : this.config.scenario === 'rush-hour' ? 0.55 : 0
+    this.inboundDepartures++
+    this.centralCredit += share
+    if (this.centralCredit >= 1 - 1e-9) {
+      this.centralCredit -= 1
+      this.centralDepartures++
+      return this.config.scenario === 'gridlock' ? this.router.core : this.router.central[Math.floor(this.rng() * this.router.central.length)]
+    }
+    const options = this.router.destinations.filter(id => id !== car.homeNode && !this.router.central.includes(id))
+    return options[Math.floor(this.rng() * options.length)]
+  }
+
+  private initializeTrips() {
+    this.centralCredit = 0
+    this.inboundDepartures = this.centralDepartures = this.completedTrips = this.completedReturns = 0
+    this.router.reset()
+    for (const car of this.cars) {
+      car.homeNode = this.router.homes[Math.floor(this.rng() * this.router.homes.length)]
+      car.tripToHome = false
+      car.tripTarget = this.newInboundTarget(car)
+      car.nextTripTarget = null
+    }
+    this.router.sense(this.cars, 0)
+  }
+
+  private routingTarget(car: CarState, lane: LaneSeg) {
+    if (this.router.endNode(lane.id) !== car.tripTarget) return car.tripTarget
+    // Plan a legal departure from the destination junction, but don't mark
+    // arrival or change the current trip until the car physically crosses it.
+    car.nextTripTarget ??= car.tripToHome ? this.newInboundTarget(car) : car.homeNode
+    return car.nextTripTarget
+  }
+
+  private arriveAtJunction(car: CarState, incoming: LaneSeg) {
+    if (this.router.endNode(incoming.id) !== car.tripTarget || !this.router.isJunction(car.tripTarget)) return
+    this.completedTrips++
+    if (car.tripToHome) this.completedReturns++
+    car.tripTarget = car.nextTripTarget ?? (car.tripToHome ? this.newInboundTarget(car) : car.homeNode)
+    car.tripToHome = !car.tripToHome
+    car.nextTripTarget = null
+  }
+
+  getTripStats() {
+    return { inboundDepartures: this.inboundDepartures, centralDepartures: this.centralDepartures,
+      completedTrips: this.completedTrips, completedReturns: this.completedReturns,
+      returningVehicles: this.cars.filter(c => c.tripToHome).length }
   }
 
   /* ---------------- cars ---------------- */
-  private buildCars(mats: CityMaterials) {
-    this.laneList = [...this.network.lanes.keys()]
+  private buildCars(mats: CityMaterials, models?: Map<string, THREE.Group>) {
+    this.laneList = [...this.network.lanes.values()].filter(lane => !lane.pocket).map(lane => lane.id)
     if (this.laneList.length === 0) return
 
     const laneWeights: Record<string, number> = { arterial: 4, collector: 2, local: 1 }
     const typeCount = [0, 0, 0, 0, 0]
     const picked: { lane: string; typeIdx: number; paint: number; dist: number }[] = []
-    // spawn de-overlap: at most one car per ~9 m of lane, otherwise the
+    // Spawn with a full truck-length gap; never force an occupied placement.
+    // At most one car per 12 m of lane, otherwise the
     // initial cluster welds into a queue that reads as a "stockpile"
     const claimed = new Map<string, number[]>()
     const claim = (lane: string, d: number) => {
       const arr = claimed.get(lane)
-      if (arr && arr.some((u) => Math.abs(u - d) < 9)) return false
+      if (arr && arr.some((u) => Math.abs(u - d) < 12)) return false
       if (arr) arr.push(d)
       else claimed.set(lane, [d])
       return true
     }
-    for (let i = 0; i < MAX_CARS; i++) {
+    for (let i = 0; i < this.config.vehicleCount; i++) {
       let segId = this.laneList[Math.floor(this.rng() * this.laneList.length)]
       let dist = 5
-      for (let tries = 0; tries < 14; tries++) {
+      let placed = false
+      for (let tries = 0; tries < 80; tries++) {
         const cand = this.laneList[Math.floor(this.rng() * this.laneList.length)]
         const seg = this.network.lanes.get(cand)
         if (!seg) continue
-        if (tries < 12 && this.rng() >= (laneWeights[seg.cls] ?? 1) / 4) continue // weighted pick
+        if (tries < 60) {
+          let weight = (laneWeights[seg.cls] ?? 1) / 4
+          const mx = (seg.x1 + seg.x2) / 2, mz = (seg.z1 + seg.z2) / 2
+          const central = Math.abs(mx) < (this.config.scenario === 'rush-hour' ? 320 : 205) && Math.abs(mz) < (this.config.scenario === 'rush-hour' ? 320 : 205)
+          if (this.config.scenario !== 'normal') weight *= central ? 2.2 : 0.22
+          if (this.config.scenario === 'gridlock' && central && seg.cls === 'arterial') weight *= 1.7
+          if (this.rng() >= Math.min(0.98, weight)) continue
+        }
         const len = Math.hypot(seg.x2 - seg.x1, seg.z2 - seg.z1)
         const d = 2 + this.rng() * Math.max(4, Math.min(60, len - 4))
-        if (claim(cand, d) || tries >= 12) {
+        if (claim(cand, d)) {
           segId = cand
           dist = d
+          placed = true
           break
+        }
+      }
+      if (!placed) {
+        search: for (const id of this.laneList) {
+          const lane = this.network.lanes.get(id)!
+          const length = Math.hypot(lane.x2 - lane.x1, lane.z2 - lane.z1)
+          for (let d = 4; d < length - 4; d += 12) if (claim(id, d)) {
+            segId = id; dist = d; placed = true; break search
+          }
         }
       }
       const typeIdx = CAR_TYPE_WEIGHTS[Math.floor(this.rng() * CAR_TYPE_WEIGHTS.length)]
@@ -451,13 +787,18 @@ export class TrafficSystem {
         stopped: false,
         conn: null,
         connNext: '',
+        plannedNext: null,
+        afterPocket: null,
+        homeNode: '', tripTarget: '', nextTripTarget: null, tripToHome: false,
         connDist: 0,
+        tail: null,
         stuck: 0,
         creep: 0,
         jammed: 0,
         forced: 0,
         serveT: 0,
         serveCd: 20 + this.rng() * 40,
+        brakeHold: 0,
       })
     }
 
@@ -467,7 +808,31 @@ export class TrafficSystem {
         this.carMeshes.push({ paint: null, glass: null, dark: null, chrome: null, lampF: null, lampR: null, extra: null, extra2: null, wheels: null, wheelOffsets: [] })
         continue
       }
-      const groups = CAR_BODY_BUILDERS[t]()
+      const modelKey = t === 0 ? 'sedan' : t === 1 ? 'estate' : t === 2 ? 'van' : null
+      const authored = modelKey ? models?.get(modelKey) : undefined
+      const fallback = CAR_BODY_BUILDERS[t]()
+      const wheelOffsets = t === 2
+        ? [{ x: -0.88, z: 1.72, r: 0.38 }, { x: 0.88, z: 1.72, r: 0.38 }, { x: -0.88, z: -1.60, r: 0.38 }, { x: 0.88, z: -1.60, r: 0.38 }]
+        : [{ x: -0.78, z: 1.34, r: 0.34 }, { x: 0.78, z: 1.34, r: 0.34 }, { x: -0.78, z: -1.34, r: 0.34 }, { x: 0.78, z: -1.34, r: 0.34 }]
+      const groups = authored ? authoredVehicleGroups(authored, wheelOffsets) : fallback
+      if (authored) {
+        const wheel = models?.get('wheel')
+        if (wheel) {
+          const authoredWheel = authoredVehicleGroups(wheel, [])
+          const scale = t === 2 ? 0.38 / 0.34 : 1
+          if (authoredWheel.tire.length && authoredWheel.hub.length) {
+            groups.tire = authoredWheel.tire.map(g => g.scale(scale, scale, scale))
+            const hub = mergeGeometries(authoredWheel.hub, false)!
+            groups.hub = [hub.scale(scale, scale, scale)]
+          } else {
+            groups.tire = fallback.tire
+            groups.hub = fallback.hub
+          }
+        } else {
+          groups.tire = fallback.tire
+          groups.hub = fallback.hub
+        }
+      }
       const mk = (geos: THREE.BufferGeometry[], mat: THREE.Material, dynamic: boolean, shadow: boolean): THREE.InstancedMesh | null => {
         if (!geos.length) return null
         const merged = mergeGeometries(geos, false)
@@ -481,10 +846,11 @@ export class TrafficSystem {
         return im
       }
       const paintMat = new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.35, metalness: 0.62 })
+      this.carOwnedMaterials.add(paintMat)
       // wheels: one instanced mesh per type (tire + hub groups), spun per instance
       let wheelIM: THREE.InstancedMesh | null = null
       if (groups.wheelOffsets.length > 0) {
-        const wheelGeo = mergeGeometries([...groups.tire, ...groups.hub], true)
+        const wheelGeo = mergeGeometries([groups.tire[0], groups.hub[0]], true)
         if (wheelGeo) {
           wheelIM = new THREE.InstancedMesh(wheelGeo, [mats.tire, mats.metal], typeCount[t] * groups.wheelOffsets.length)
           wheelIM.instanceMatrix.setUsage(THREE.DynamicDrawUsage)
@@ -509,7 +875,10 @@ export class TrafficSystem {
         for (let s = 0; s < typeCount[t]; s++) tm.paint.setColorAt(s, new THREE.Color('#ffffff'))
         if (tm.paint.instanceColor) tm.paint.instanceColor.needsUpdate = true
       }
-      // taillights: dim at night, flash bright white-red when braking
+      // Allocate per-instance tint buffers before the first render.
+      if (tm.lampF) {
+        for (let s = 0; s < typeCount[t]; s++) tm.lampF.setColorAt(s, new THREE.Color().setScalar(.15))
+      }
       if (tm.lampR) {
         for (let s = 0; s < typeCount[t]; s++) tm.lampR.setColorAt(s, new THREE.Color('#9a9a9a'))
         if (tm.lampR.instanceColor) tm.lampR.instanceColor.needsUpdate = true
@@ -526,6 +895,7 @@ export class TrafficSystem {
         ctx.fillText('TAXI', 64, 34)
         const sideMat = new THREE.MeshBasicMaterial({ map: tex(c, false), toneMapped: false })
         const blackMat = new THREE.MeshBasicMaterial({ color: '#131313' })
+        this.carOwnedMaterials.add(sideMat); this.carOwnedMaterials.add(blackMat)
         const signGeo = new THREE.BoxGeometry(0.66, 0.22, 0.34)
         signGeo.translate(0, 1.52, -0.2)
         const im = new THREE.InstancedMesh(signGeo, [blackMat, blackMat, blackMat, blackMat, sideMat, sideMat], typeCount[t])
@@ -536,6 +906,7 @@ export class TrafficSystem {
       } else if (t === 3) {
         const sideMat = new THREE.MeshStandardMaterial({ map: tex(cargoSideCanvas(), false), roughness: 0.6, metalness: 0.15 })
         const plainMat = new THREE.MeshStandardMaterial({ color: '#d8d5cc', roughness: 0.72, metalness: 0.1 })
+        this.carOwnedMaterials.add(sideMat); this.carOwnedMaterials.add(plainMat)
         const L = 7.6
         const W = 2.45
         const cargoGeo = new THREE.BoxGeometry(W, 2.35, L * 0.58)
@@ -564,6 +935,7 @@ export class TrafficSystem {
         wctx.fillText('WASTE · RECYCLING', 128, 84)
         const bodyMat = new THREE.MeshStandardMaterial({ map: tex(wc, false), roughness: 0.62, metalness: 0.12 })
         const plainMat2 = new THREE.MeshStandardMaterial({ color: '#3f5c48', roughness: 0.62, metalness: 0.12 })
+        this.carOwnedMaterials.add(bodyMat); this.carOwnedMaterials.add(plainMat2)
         const Lg = 8.2
         const Wg = 2.5
         const bodyGeo = new THREE.BoxGeometry(Wg * 0.92, 2.0, Lg * 0.52)
@@ -577,7 +949,9 @@ export class TrafficSystem {
         // amber beacon on the cab roof (always glowing — service vehicle)
         const beaconGeo = new THREE.CylinderGeometry(0.09, 0.11, 0.16, 8)
         beaconGeo.translate(0, 2.68, Lg / 2 - 1.35)
-        const beaconIM = new THREE.InstancedMesh(beaconGeo, new THREE.MeshBasicMaterial({ color: '#ffb43a', toneMapped: false }), typeCount[t])
+        const beaconMat = new THREE.MeshBasicMaterial({ color: '#ffb43a', toneMapped: false })
+        this.carOwnedMaterials.add(beaconMat)
+        const beaconIM = new THREE.InstancedMesh(beaconGeo, beaconMat, typeCount[t])
         beaconIM.instanceMatrix.setUsage(THREE.DynamicDrawUsage)
         beaconIM.frustumCulled = false
         this.group.add(beaconIM)
@@ -587,10 +961,14 @@ export class TrafficSystem {
     }
   }
 
-  private updateCars(dt: number, night: number) {
+  private updateCars(dt: number, _night: number, writeMatrices = true) {
     const dummy = new THREE.Object3D()
-    dummy.rotation.order = 'YXZ' // yaw first, then axle spin about local X
-    const paintHex = ['#c94f3d', '#d8d4cc', '#5b7461', '#9a9da1', '#d8a832', '#3f4a42']
+    dummy.rotation.order = 'YXZ'
+    this.activeConnectors.clear()
+    for (const car of this.cars) {
+      if (car.tail && car.dist > this.carLength(car) / 2 + 2.2) car.tail = null
+      if (car.conn || car.tail) this.activeConnectors.add(car)
+    }
     for (let i = 0; i < this.cars.length; i++) {
       const car = this.cars[i]
       const seg = this.network.lanes.get(car.segId)
@@ -603,11 +981,11 @@ export class TrafficSystem {
       }
 
       /* ---------- desired speed ---------- */
+      const stopOffset = this.carLength(car) / 2 + 1
       let target = Math.min(seg.speed, 11)
       let fx: number, fz: number
       if (car.conn) {
-        // current heading from the connector sample below; approximate with
-        // the stored heading from the previous frame for the cone test
+        // Stored tangent from the preceding connector sample.
         fx = Math.sin(car.heading)
         fz = Math.cos(car.heading)
         if (!car.conn.straight) target = Math.min(target, 4.6) // slow through turns
@@ -617,51 +995,78 @@ export class TrafficSystem {
         fz = (seg.z2 - seg.z1) / len0
       }
 
-      // forward obstacle cone: any vehicle ahead within ~11 m and 2.3 m
-      // laterally → brake. Crossing conflicts yield to the right.
-      // DEADLOCK ESCAPE LADDER — the old sim could stockpile cars forever:
-      // a crossing/angled pair inside an intersection BOTH saw |lat| < 1.5
-      // (which always brakes) and creep never relaxed that term, so whole
-      // queues froze behind them. Escalation:
-      //   jammed > 7 s  → creep 2.2 s (ignore yield-to-the-right)
-      //   jammed > 15 s → FORCED 3.5 s (only a bumper dead-ahead stops us;
-      //                    lights + box discipline ignored, capped 3 m/s)
-      //   jammed > 32 s → teleport out to a free lane (last resort)
-      const rx = -fz // right vector (x-east, z-south, y-up)
-      const rz = fx
-      const isForced = car.forced > 0
+      // Follow distance along the actual lane/turn, rather than a forward
+      // cone that mistakes a waiting cross approach for a leader. Platoons
+      // retain their bumper gap even around a curved connector.
+      const laneRemaining = Math.hypot(seg.x2 - seg.x1, seg.z2 - seg.z1) - car.dist
       for (const other of this.cars) {
         if (other === car) continue
-        const dx = other.x - car.x
-        const dz = other.z - car.z
-        const fwd = dx * fx + dz * fz
-        if (fwd < 0.4 || fwd > 11) continue
-        const lat = dx * rx + dz * rz
-        if (Math.abs(lat) > 2.3) continue
-        if (isForced) {
-          if (Math.abs(lat) < 0.75 && fwd < 4.5) target = 0 // physical bumper ahead
-          continue
+        let gap = Infinity
+        if (car.conn) {
+          if (other.conn === car.conn) gap = other.connDist - car.connDist
+          else if (!other.conn && other.segId === car.connNext) gap = car.conn.len - car.connDist + other.dist
+        } else {
+          if (other.segId === car.segId) gap = other.conn ? laneRemaining + other.connDist : other.dist - car.dist
         }
-        if (Math.abs(lat) < 1.5 || (car.creep <= 0 && lat > 0)) {
-          target = Math.min(target, Math.max(0, (fwd - 4.2) * 1.4))
-        }
+        if (gap <= 0 || !Number.isFinite(gap)) continue
+        const clearance = gap - (this.carLength(car) + this.carLength(other)) / 2 - 1.8
+        target = Math.min(target, Math.max(0, clearance * 1.4))
       }
-      if (isForced) target = Math.min(target, 3)
-      // traffic light at end of seg (skip while inside the intersection or
-      // while escaping a deadlock — a rig frozen mid-box must clear it)
-      if (!car.conn && !isForced) {
-        const endX = seg.x2
-        const endZ = seg.z2
+      // Brake before the stop line if the signal, reserved turn or exit is blocked.
+      if (!car.conn) {
         const distToEnd = Math.hypot(seg.x2 - seg.x1, seg.z2 - seg.z1) - car.dist
-        if (distToEnd < 18 && distToEnd > 2) {
-          for (const sg of this.network.signals) {
-            if (Math.hypot(sg.x - endX, sg.z - endZ) < 14) {
-              const axis: 'x' | 'z' = Math.abs(fx) > Math.abs(fz) ? 'x' : 'z'
-              if (!this.isGreen(sg, axis)) {
-                target = Math.min(target, Math.max(0, (distToEnd - 2.5) * 0.75))
-              }
-              break
+        if (distToEnd < 22 && !car.plannedNext && seg.next.length) {
+          const choices = seg.routeChoices ?? seg.next
+          const targetNode = this.routingTarget(car, seg)
+          const exit = this.router.choose(seg, choices, targetNode)
+          if (seg.routeChoices) {
+            car.afterPocket = exit
+            car.plannedNext = seg.next.find(id => this.network.lanes.get(id)!.next.includes(exit)) ?? seg.next[0]
+          } else car.plannedNext = exit
+        }
+        if (distToEnd < 18 && car.plannedNext) {
+          const plannedPath = this.network.connectors.get(`${seg.id}>${car.plannedNext}`)
+          const stalledMovement = car.stuck >= 5 && plannedPath && !this.connectorClear(car, plannedPath)
+          if (seg.routeChoices && (!this.exitClear(car, car.plannedNext)
+            || (car.afterPocket && !this.exitClear(car, car.afterPocket)) || stalledMovement)) {
+            // Choose the lane before the taper. Once inside a pocket cars
+            // obey its arrows; they cannot cut sideways across a waiting lane.
+            const choices = seg.next.flatMap(id => {
+              if (!this.exitClear(car, id)) return []
+              const path = this.network.connectors.get(`${seg.id}>${id}`)
+              if (stalledMovement && path && !this.connectorClear(car, path)) return []
+              return this.network.lanes.get(id)!.next.filter(exit => this.exitClear(car, exit)).map(exit => ({ pocket: id, exit }))
+            })
+            if (choices.length) {
+              const targetNode = this.routingTarget(car, seg)
+              const cost = (choice: typeof choices[number]) => this.router.score(seg, choice.exit, targetNode)
+              const choice = choices.reduce((best, next) => cost(next) < cost(best) ? next : best)
+              car.plannedNext = choice.pocket
+              car.afterPocket = choice.exit
             }
+          }
+          if (!seg.routeChoices && distToEnd < 8 && car.speed < 2 && (!this.exitClear(car, car.plannedNext) || stalledMovement)) {
+            // Retain destination-biased demand, but take a legal detour when
+            // its chosen exit is full. A single blocked turn must not freeze
+            // every following car while another exit has storage available.
+            const alternatives = seg.next.filter(id => {
+              const path = this.network.connectors.get(`${seg.id}>${id}`)
+              return id !== car.plannedNext && this.exitClear(car, id) && (!path || this.connectorClear(car, path))
+            })
+            if (alternatives.length) {
+              car.plannedNext = this.router.choose(seg, alternatives, this.routingTarget(car, seg))
+            }
+          }
+          const path = this.network.connectors.get(`${seg.id}>${car.plannedNext}`)
+          if (!this.exitClear(car, car.plannedNext) || (path && !this.connectorClear(car, path))) {
+            target = Math.min(target, Math.sqrt(2 * 3 * Math.max(0, distToEnd - stopOffset)))
+          }
+        }
+        if (distToEnd < 18) {
+          const signal = this.laneSignals.get(seg.id)
+          const axis: 'x' | 'z' = Math.abs(fx) > Math.abs(fz) ? 'x' : 'z'
+          if (signal && !this.isGreen(signal, axis, seg)) {
+            target = Math.min(target, Math.sqrt(2 * 3 * Math.max(0, distToEnd - stopOffset)))
           }
         }
       }
@@ -674,7 +1079,7 @@ export class TrafficSystem {
           target = 0
           serving = true
           if (car.serveT <= 0) car.serveCd = 160
-        } else if (car.serveCd <= 0) {
+        } else if (car.serveCd <= 0 && !car.conn && !seg.pocket) {
           for (const [gx, gz] of GARBAGE_SPOTS) {
             const dxs = car.x - gx
             const dzs = car.z - gz
@@ -690,85 +1095,69 @@ export class TrafficSystem {
       const before = car.speed
       const accel = target > car.speed ? 3.5 : 9
       car.speed += Math.sign(target - car.speed) * Math.min(Math.abs(target - car.speed), accel * dt)
-      const braking = car.speed < before - 0.001 || serving
+      const braking = car.speed < before - 0.001 || serving || car.speed < .15
+      car.brakeHold = braking ? .18 : Math.max(0, (car.brakeHold ?? 0) - dt)
       car.odo += car.speed * dt
-      // deadlock ladder bookkeeping: "jammed" only accumulates for a car
-      // that is COMMITTED at the intersection (on a connector or at/over
-      // the stop line) — a car waiting legally for a red further back must
-      // never escalate into running the light
+      // Legal queues remain visible; they never trigger red-light overrides.
       car.stuck = car.speed < 0.35 ? car.stuck + dt : 0
-      const distToEnd0 = Math.hypot(seg.x2 - seg.x1, seg.z2 - seg.z1) - car.dist
-      const committed = !!car.conn || distToEnd0 < 2.2
-      if (car.speed < 0.35 && committed) car.jammed += dt
-      else car.jammed = Math.max(0, car.jammed - dt * 3)
-      if (car.stuck > 7 && car.creep <= 0 && car.forced <= 0) {
-        car.creep = 2.2
-        car.stuck = 0
-      }
-      if (car.jammed > 15 && car.forced <= 0) {
-        car.forced = 3.5
-        car.jammed = 8 // keep memory so it re-arms if still not moving
-      }
-      if (car.jammed > 32) {
-        // last resort: the car is wedged into a pile — lift it out to a
-        // free lane away from the jam and out of the player's view
-        car.segId = this.randomFreeLane(45)
-        car.dist = 0
-        car.conn = null
-        car.speed = 5
-        car.stuck = 0
-        car.jammed = 0
-        car.creep = 0
-        car.forced = 0
-        continue
-      }
-      if (car.creep > 0) car.creep -= dt
-      if (car.forced > 0) car.forced -= dt
+      car.jammed = car.stuck
+      car.creep = 0
+      car.forced = 0
 
       if (car.conn) {
         car.connDist += car.speed * dt
         if (car.connDist >= car.conn.len) {
+          const internal = car.conn.internal
+          car.tail = car.conn
           car.dist = car.connDist - car.conn.len
           car.segId = car.connNext
           car.conn = null
+          car.plannedNext = internal ? car.afterPocket : null
+          car.afterPocket = null
+          if (!internal) {
+            this.arriveAtJunction(car, seg)
+            this.completedSegments++
+            this.transitionTimes.push(this.simTime)
+          }
         }
       } else {
         car.dist += car.speed * dt
         const len = Math.hypot(seg.x2 - seg.x1, seg.z2 - seg.z1)
-        if (car.dist >= len) {
+        if (car.dist >= len - stopOffset) {
           // pick next lane + take its connector across the intersection
           if (seg.next.length > 0 && car.speed > 0.5) {
-            let nid: string
-            if (this.rng() < 0.6) {
-              const straight = seg.next.find((n) => {
-                const ns = this.network.lanes.get(n)
-                return ns && Math.abs((ns.x2 - ns.x1) * fx + (ns.z2 - ns.z1) * fz) > 0.9 * Math.hypot(ns.x2 - ns.x1, ns.z2 - ns.z1)
-              })
-              nid = straight ?? seg.next[Math.floor(this.rng() * seg.next.length)]
-            } else {
-              nid = seg.next[Math.floor(this.rng() * seg.next.length)]
-            }
+            const nid = car.plannedNext ?? seg.next[Math.floor(this.rng() * seg.next.length)]
             const conn = this.network.connectors.get(`${seg.id}>${nid}`)
             // BOX DISCIPLINE ("don't block the pack"): only enter the
             // intersection when the exit lane's first meters are moving —
             // driving into a stopped queue is what gridlocks a junction
-            if (car.forced <= 0 && !this.exitClear(nid, 7.5)) {
-              car.dist = len - 0.15
-              car.speed = Math.min(car.speed, 0.8)
+            const approachAxis: 'x' | 'z' = Math.abs(fx) > Math.abs(fz) ? 'x' : 'z'
+            const signal = this.laneSignals.get(seg.id)
+            const green = !signal || this.isGreen(signal, approachAxis, seg)
+            if (!green || !this.exitClear(car, nid) || (conn && !this.connectorClear(car, conn))) {
+              car.dist = Math.min(car.dist, len - stopOffset)
+              car.speed = 0
             } else if (conn && conn.len > 0.3) {
+              car.tail = null
               car.conn = conn
               car.connNext = nid
               car.connDist = car.dist - len
+              this.activeConnectors.add(car)
             } else {
+              this.arriveAtJunction(car, seg)
               car.segId = nid
+              car.plannedNext = null
               car.dist -= len
+              this.completedSegments++
+              this.transitionTimes.push(this.simTime)
             }
           } else {
-            car.dist = Math.min(car.dist, len - 0.1)
+            car.dist = Math.min(car.dist, len - stopOffset)
             if (seg.next.length === 0) {
               car.segId = this.randomFreeLane()
               car.dist = 0
               car.conn = null
+              this.recoveryRespawns++
             }
           }
         }
@@ -790,6 +1179,12 @@ export class TrafficSystem {
         px = a.x + (b.x - a.x) * t
         pz = a.z + (b.z - a.z) * t
         heading = Math.atan2(b.x - a.x, b.z - a.z)
+        if (car.connDist < 0) {
+          const length = Math.hypot(seg.x2 - seg.x1, seg.z2 - seg.z1)
+          px = seg.x2 + (seg.x2 - seg.x1) / length * car.connDist
+          pz = seg.z2 + (seg.z2 - seg.z1) / length * car.connDist
+          heading = Math.atan2(seg.x2 - seg.x1, seg.z2 - seg.z1)
+        }
       } else {
         const s2 = this.network.lanes.get(car.segId)
         if (!s2) continue
@@ -802,6 +1197,9 @@ export class TrafficSystem {
       car.x = px
       car.z = pz
       car.heading = heading
+      // Multiple fixed simulation steps can feed one displayed frame. Keep
+      // every physics step, but only build/upload the final car pose.
+      if (!writeMatrices) continue
 
       // write matrices — geometry is pre-built per type, one transform per group
       const tm = this.carMeshes[car.typeIdx]
@@ -811,19 +1209,17 @@ export class TrafficSystem {
       dummy.scale.setScalar(1)
       dummy.updateMatrix()
       tm.paint?.setMatrixAt(car.slot, dummy.matrix)
-      tm.paint?.setColorAt(car.slot, new THREE.Color(paintHex[car.paint]))
+      tm.paint?.setColorAt(car.slot, this.paintTints[car.paint])
       tm.glass?.setMatrixAt(car.slot, dummy.matrix)
       tm.dark?.setMatrixAt(car.slot, dummy.matrix)
       tm.chrome?.setMatrixAt(car.slot, dummy.matrix)
       tm.extra?.setMatrixAt(car.slot, dummy.matrix)
       tm.extra2?.setMatrixAt(car.slot, dummy.matrix)
-      // head/tail lights: taillights flash bright whenever the car slows down
-      const lampScale = braking ? 1.35 : night > 0.4 ? 1 : 0.0001
-      dummy.scale.setScalar(lampScale)
-      dummy.updateMatrix()
+      // Lenses share the body transform. Scaling about the car origin used to
+      // push them away from the bumpers when braking and shrink them into the
+      // road in daylight. Brightness is independent of geometry and braking.
       tm.lampF?.setMatrixAt(car.slot, dummy.matrix)
       tm.lampR?.setMatrixAt(car.slot, dummy.matrix)
-      tm.lampR?.setColorAt(car.slot, new THREE.Color(braking ? '#ffffff' : '#9a9a9a'))
       // spinning wheels (spin angle from lifetime odometer per wheel radius)
       if (tm.wheels) {
         const cosH = Math.cos(car.heading)
@@ -840,6 +1236,7 @@ export class TrafficSystem {
         }
       }
     }
+    if (!writeMatrices) return
     for (const tm of this.carMeshes) {
       if (tm.paint) {
         tm.paint.instanceMatrix.needsUpdate = true
@@ -886,7 +1283,7 @@ export class TrafficSystem {
       if (si < 0 || !path.stopIds[si]) continue
       const cosH = Math.cos(bus.heading)
       const sinH = Math.sin(bus.heading)
-      const lx = 3.9 // curbside standoff outside the +x door face
+      const lx = -3.9 // curbside standoff outside the -x door face
       const lz = 4.5 // front door
       out.push({
         x: bus.x,
@@ -1046,16 +1443,14 @@ export class TrafficSystem {
     const busDarkIM = new THREE.InstancedMesh(darkGeo, mats.metalDark, MAX_BUSES)
     // wheels: centered tire+hub geometry, spun per instance every frame
     const busWheelOffsets: { x: number; z: number; r: number }[] = []
-    const busTireGeos: THREE.BufferGeometry[] = []
-    const busHubGeos: THREE.BufferGeometry[] = []
     for (const wz of [L * 0.335, -L * 0.315]) {
       for (const wx of [-(W / 2 - 0.04), W / 2 - 0.04]) {
         busWheelOffsets.push({ x: wx, z: wz, r: 0.48 })
-        busTireGeos.push(vCyl(0.48, 0.3, 0, 0, 0, 14))
-        busHubGeos.push(vCyl(0.27, 0.32, 0, 0, 0, 8))
       }
     }
-    const busWheelIM = new THREE.InstancedMesh(mergeGeometries([...busTireGeos, ...busHubGeos], true)!, [mats.tire, mats.metal], MAX_BUSES * busWheelOffsets.length)
+    // One centred tire/hub pair per instance. Repeating these inside the
+    // geometry as well used to draw four coincident copies of every wheel.
+    const busWheelIM = new THREE.InstancedMesh(mergeGeometries([vCyl(0.48, 0.3, 0, 0, 0, 14), vCyl(0.27, 0.32, 0, 0, 0, 8)], true)!, [mats.tire, mats.metal], MAX_BUSES * busWheelOffsets.length)
     const lampFGeos: THREE.BufferGeometry[] = []
     const lampRGeos: THREE.BufferGeometry[] = []
     for (const sx of [-1, 1]) {
@@ -1073,7 +1468,7 @@ export class TrafficSystem {
     sctx.font = 'bold 28px Arial'
     sctx.textAlign = 'center'
     sctx.textBaseline = 'middle'
-    sctx.fillText('12 · CENTRAL HUB', 128, 25)
+    sctx.fillText('SOLHEIM CITY BUS', 128, 25)
     const signGeo = new THREE.PlaneGeometry(1.7, 0.32)
     signGeo.translate(0, 2.52, L / 2 + 0.04)
     const busSignIM = new THREE.InstancedMesh(signGeo, new THREE.MeshBasicMaterial({ map: tex(sc, false), toneMapped: false }), MAX_BUSES)
@@ -1098,8 +1493,17 @@ export class TrafficSystem {
     this.busMeshes = { body: busBodyIM, dark: busDarkIM, wheels: busWheelIM, wheelOffsets: busWheelOffsets, lampF: busLampFIM, lampR: busLampRIM, sign: busSignIM, doorA: busDoorA, doorB: busDoorB }
 
     const assignments = [0, 0, 1, 1, 2, 2]
+    const stationStop = this.plan.stops.find(s => s.name.startsWith('Solheim Interchange'))
     for (let i = 0; i < MAX_BUSES; i++) {
-      this.buses.push({ routeIdx: assignments[i % assignments.length], dist: this.rng() * this.busPaths[assignments[i % assignments.length]].total, speed: 8, dwell: 0, x: 0, z: 0, heading: 0, doorT: 0 })
+      const routeIdx = assignments[i % assignments.length] % this.busPaths.length
+      const path = this.busPaths[routeIdx]
+      const stationIdx = stationStop ? path.stopIds.indexOf(stationStop.id) : -1
+      const stationDistance = stationIdx >= 0 ? path.stopDists[stationIdx] : 0
+      const nearStation = routeIdx === 0 && stationIdx >= 0
+      const dist = nearStation
+        ? (stationDistance - (i === 0 ? 0 : 240) + path.total) % path.total
+        : this.rng() * path.total
+      this.buses.push({ routeIdx, dist, speed: nearStation && i === 0 ? 0 : 8, dwell: nearStation && i === 0 ? 7 : 0, x: 0, z: 0, heading: 0, doorT: nearStation && i === 0 ? 1 : 0, brakeHold: 0 })
     }
   }
 
@@ -1109,6 +1513,7 @@ export class TrafficSystem {
     const bm = this.busMeshes
     for (let i = 0; i < this.buses.length; i++) {
       const bus = this.buses[i]
+      const previousSpeed = bus.speed
       const path = this.busPaths[bus.routeIdx]
       if (!path) continue
       if (bus.dwell > 0) {
@@ -1151,8 +1556,8 @@ export class TrafficSystem {
       // right-side offset 2.6
       const ux = (b.x - a.x) / segLen
       const uz = (b.z - a.z) / segLen
-      bus.x = a.x + (b.x - a.x) * t + uz * 2.6
-      bus.z = a.z + (b.z - a.z) * t - ux * 2.6
+      bus.x = a.x + (b.x - a.x) * t - uz * 2.6
+      bus.z = a.z + (b.z - a.z) * t + ux * 2.6
       bus.heading = Math.atan2(ux, uz)
 
       if (!bm) continue
@@ -1164,11 +1569,9 @@ export class TrafficSystem {
       bm.dark.setMatrixAt(i, dummy.matrix)
       bm.lampF.setMatrixAt(i, dummy.matrix)
       bm.sign.setMatrixAt(i, dummy.matrix)
-      // brake lights glow while dwelling at stops
-      dummy.scale.setScalar(bus.dwell > 0 ? 1.3 : 1)
-      dummy.updateMatrix()
+      bus.brakeHold = bus.dwell > 0 || bus.speed < previousSpeed - .001 || bus.speed < .15
+        ? .18 : Math.max(0, bus.brakeHold - dt)
       bm.lampR.setMatrixAt(i, dummy.matrix)
-      dummy.scale.setScalar(1)
       // doors: open while dwelling, close just before departure
       const doorTarget = bus.dwell > 0.8 ? 1 : 0
       bus.doorT += (doorTarget - bus.doorT) * Math.min(1, dt * 5)
@@ -1177,19 +1580,19 @@ export class TrafficSystem {
       const sinHb = Math.sin(bus.heading)
       for (let d = 0; d < 2; d++) {
         const dz = this.busDoorZ[d]
-        const hx = this.busW + 0.05 // hinge plane just outside the body skin
+        const hx = -(this.busW / 2 + 0.035) // doors on the curb side in right-hand traffic
         // leaf A: hinged at the door's front edge, extends −z, swings +x when open
         let lx = cosHb * hx + sinHb * (dz + 0.7)
         let lz = -sinHb * hx + cosHb * (dz + 0.7)
         dummy.position.set(bus.x + lx, 1.58, bus.z + lz)
-        dummy.rotation.set(0, bus.heading - open, 0)
+        dummy.rotation.set(0, bus.heading + open, 0)
         dummy.updateMatrix()
         bm.doorA.setMatrixAt(i * 2 + d, dummy.matrix)
         // leaf B: hinged at the rear edge, extends +z, swings +x when open
         lx = cosHb * hx + sinHb * (dz - 0.7)
         lz = -sinHb * hx + cosHb * (dz - 0.7)
         dummy.position.set(bus.x + lx, 1.58, bus.z + lz)
-        dummy.rotation.set(0, bus.heading + open, 0)
+        dummy.rotation.set(0, bus.heading - open, 0)
         dummy.updateMatrix()
         bm.doorB.setMatrixAt(i * 2 + d, dummy.matrix)
       }
@@ -1373,19 +1776,17 @@ export class TrafficSystem {
     }
     // wheels: 2 bogies × 2 wheels per segment, 3 segments, 2 trams per route
     const wheelOffsets: { x: number; z: number; r: number }[] = []
-    const tireGeos: THREE.BufferGeometry[] = []
-    const hubGeos: THREE.BufferGeometry[] = []
     for (let seg = 0; seg < 3; seg++) {
       const segOff = (seg - 1) * 10.0
       for (const bz of [2.9, -2.9]) {
         for (const wx of [-(W / 2 - 0.08), W / 2 - 0.08]) {
           wheelOffsets.push({ x: wx, z: segOff + bz, r: 0.4 })
-          tireGeos.push(vCyl(0.4, 0.24, 0, 0, 0, 12))
-          hubGeos.push(vCyl(0.22, 0.26, 0, 0, 0, 8))
         }
       }
     }
-    const wheels = new THREE.InstancedMesh(mergeGeometries([...tireGeos, ...hubGeos], true)!, [mats.tire, mats.metal], 2 * wheelOffsets.length)
+    // The 12 wheel positions belong in instance matrices, not in 12 copies
+    // of the same centred geometry inside every instance.
+    const wheels = new THREE.InstancedMesh(mergeGeometries([vCyl(0.4, 0.24, 0, 0, 0, 12), vCyl(0.22, 0.26, 0, 0, 0, 8)], true)!, [mats.tire, mats.metal], 2 * wheelOffsets.length)
     wheels.instanceMatrix.setUsage(THREE.DynamicDrawUsage)
     wheels.frustumCulled = false
     this.group.add(wheels)
@@ -1490,6 +1891,15 @@ export class TrafficSystem {
         // check required speed < 2.2 while target speed was always 8 →
         // trams blew through every station without ever opening a door)
         let dStop = Infinity
+        let dConflict = Infinity
+        const along = path.from + tram.dist
+        for (const car of this.activeConnectors) {
+          if (!car.conn) continue
+          const bounds = this.railBounds(car.conn, tram.routeIdx, tram.dir)
+          if (!bounds) continue
+          const distance = tram.dir > 0 ? bounds.lo - along - 17 : along - bounds.hi - 17
+          if (distance >= 0) dConflict = Math.min(dConflict, distance)
+        }
         for (const sp of path.stops) {
           const sd = Math.abs(sp - path.from)
           const dd = (sd - tram.dist) * tram.dir
@@ -1501,7 +1911,8 @@ export class TrafficSystem {
         } else {
           tram.speed += Math.sign(8 - tram.speed) * Math.min(Math.abs(8 - tram.speed), 2.2 * dt)
         }
-        const step = tram.speed * dt
+        if (dConflict < 30) tram.speed = Math.min(tram.speed, Math.sqrt(2 * 3 * Math.max(0, dConflict)))
+        const step = Math.min(tram.speed * dt, dConflict)
         tram.odo += step
         if (dStop <= step + 0.05) {
           // snap onto the stop we were approaching
@@ -1621,48 +2032,6 @@ export class TrafficSystem {
     }
   }
 
-  /* ---------------- streaming: keep vehicles near the player ---------------- */
-  private streamTimer = 0
-
-  private stream(playerPos: THREE.Vector3) {
-    const px = playerPos.x
-    const pz = playerPos.z
-    for (const car of this.cars) {
-      const d2 = (car.x - px) ** 2 + (car.z - pz) ** 2
-      if (d2 < 380 * 380) continue
-      for (let tries = 0; tries < 14; tries++) {
-        const seg = this.network.lanes.get(this.laneList[Math.floor(this.rng() * this.laneList.length)])
-        if (!seg) continue
-        const mx = (seg.x1 + seg.x2) / 2
-        const mz = (seg.z1 + seg.z2) / 2
-        const d2s = (mx - px) ** 2 + (mz - pz) ** 2
-        if (d2s > 110 * 110 && d2s < 300 * 300) {
-          const len = Math.hypot(seg.x2 - seg.x1, seg.z2 - seg.z1)
-          const dist = this.rng() * Math.max(4, Math.min(40, len - 4))
-          // never drop onto an occupied stretch — that welded instant
-          // queues (a classic stockpile source)
-          let occupied = false
-          for (const other of this.cars) {
-            if (other !== car && other.segId === seg.id && Math.abs(other.dist - dist) < 12) {
-              occupied = true
-              break
-            }
-          }
-          if (occupied && tries < 12) continue
-          car.segId = seg.id
-          car.dist = dist
-          car.speed = 5
-          car.conn = null
-          car.stuck = 0
-          car.creep = 0
-          car.jammed = 0
-          car.forced = 0
-          break
-        }
-      }
-    }
-  }
-
   /** pick a lane whose start is clear of other cars (and optionally far
    *  enough from the player to hide a respawn pop-in) */
   private randomFreeLane(minPlayerDist = 0): string {
@@ -1685,12 +2054,113 @@ export class TrafficSystem {
     return fallback
   }
 
-  /** BOX DISCIPLINE check: is the first `d` meters of lane `nid` free of
-   *  standing or merging traffic? */
-  private exitClear(nid: string, d: number): boolean {
+  private carLength(car: CarState): number {
+    return [4.5, 4.65, 5.3, 7.6, 8.2][car.typeIdx] ?? 4.5
+  }
+
+  /** Reserve conflicting paths before entering. Opposing straight lanes can
+   * proceed together, but turns and cross traffic must clear the shared box. */
+  private connectorClear(car: CarState, candidate: ConnPath): boolean {
+    if (!this.tramClear(candidate)) return false
+    for (const other of this.activeConnectors) {
+      const occupied = other.conn ?? other.tail
+      if (other === car || !occupied) continue
+      const progress = other.conn ? other.connDist : occupied.len + other.dist
+      if (candidate === occupied) {
+        // Same movement can discharge at a safe following headway instead of
+        // serializing every car for the full length of the junction.
+        const lane = this.network.lanes.get(car.segId)!
+        const remaining = Math.hypot(lane.x2 - lane.x1, lane.z2 - lane.z1) - car.dist
+        if (progress + remaining < (this.carLength(car) + this.carLength(other)) / 2 + 1.8 + car.speed * 0.6) return false
+        continue
+      }
+      let conflicts = this.conflictCache.get(candidate)
+      if (!conflicts) this.conflictCache.set(candidate, conflicts = new WeakMap())
+      let conflictEnd = conflicts.get(occupied)
+      if (conflictEnd === undefined) {
+        conflictEnd = this.conflictEnd(candidate, occupied)
+        conflicts.set(occupied, conflictEnd)
+      }
+      // The occupied car's rear has passed this movement's shared area. Other
+      // turns may enter now even while it continues towards a different exit.
+      if (conflictEnd >= 0 && progress - this.carLength(other) / 2 < conflictEnd + 1.4) return false
+    }
+    return true
+  }
+
+  private tramClear(candidate: ConnPath): boolean {
+    const horizon = candidate.len / (candidate.straight ? 8 : 4.6) + 2.5
+    for (const tram of this.trams) {
+      const track = this.tramPaths[tram.routeIdx]
+      const bounds = this.railBounds(candidate, tram.routeIdx, tram.dir)
+      if (!bounds) continue
+      const along = track.from + tram.dist
+      const future = along + tram.dir * 8 * horizon
+      if (Math.max(along, future) >= bounds.lo - 17 && Math.min(along, future) <= bounds.hi + 17) return false
+    }
+    return true
+  }
+
+  private railBounds(candidate: ConnPath, route: number, direction: number) {
+    let cached = this.railCrossings.get(candidate)
+    if (!cached) this.railCrossings.set(candidate, cached = new Map())
+    const key = `${route}:${direction}`
+    if (cached.has(key)) return cached.get(key)!
+    const track = this.tramPaths[route]
+    const lateral = track.coord + (track.axis === 'x' ? direction : -direction) * 1.6
+    const crossing = this.samples(candidate).filter(p => Math.abs((track.axis === 'x' ? p.z : p.x) - lateral) < 2.55)
+    const bounds = crossing.length ? {
+      lo: Math.min(...crossing.map(p => track.axis === 'x' ? p.x : p.z)),
+      hi: Math.max(...crossing.map(p => track.axis === 'x' ? p.x : p.z)),
+    } : null
+    cached.set(key, bounds)
+    return bounds
+  }
+
+  private samples(path: ConnPath) {
+    let samples = this.pathSamples.get(path)
+    if (samples) return samples
+    samples = []
+    for (let i = 1; i < path.pts.length; i++) {
+      const a = path.pts[i - 1], b = path.pts[i]
+      const length = path.cum[i] - path.cum[i - 1]
+      const count = Math.max(1, Math.ceil(length / 0.75))
+      for (let j = 0; j <= count; j++) {
+        const t = j / count
+        samples.push({ x: a.x + (b.x - a.x) * t, z: a.z + (b.z - a.z) * t, d: path.cum[i - 1] + length * t })
+      }
+    }
+    this.pathSamples.set(path, samples)
+    return samples
+  }
+
+  /** Last distance on occupied's centreline that overlaps candidate's swept
+   * corridor. Sampling adds a conservative 0.75m margin to the conflict zone;
+   * vehicle length and a further rear clearance are applied on release. */
+  private conflictEnd(candidate: ConnPath, occupied: ConnPath): number {
+    let end = -1
+    // Long trucks sweep outside the centreline on tight curves. Keep a wider
+    // corridor for turns while allowing opposing straight lanes in parallel.
+    const corridor = candidate.straight && occupied.straight ? 3.2 : 5
+    for (const b of this.samples(occupied)) {
+      if (this.samples(candidate).some(a => (a.x - b.x) ** 2 + (a.z - b.z) ** 2 < corridor ** 2)) end = Math.max(end, b.d + 0.75)
+    }
+    return end
+  }
+
+  /** Reserve enough downstream storage for every car already committed to
+   * this exit. Moving platoons may share a turn; a stopped queue may not spill
+   * back into the box. Use actual vehicle lengths, not a worst-case truck. */
+  private exitClear(car: CarState, nid: string): boolean {
+    let reserved = 0
     for (const other of this.cars) {
-      if (other.segId === nid && other.dist < d && other.speed < 1.2) return false
-      if (other.conn && other.connNext === nid && other.connDist < d) return false
+      if (other !== car && other.conn && other.connNext === nid) reserved += this.carLength(other) + 1.8
+    }
+    const lane = this.network.lanes.get(nid)
+    if (!lane || reserved + this.carLength(car) + 4 > Math.hypot(lane.x2 - lane.x1, lane.z2 - lane.z1)) return false
+    for (const other of this.cars) {
+      if (other !== car && !other.conn && other.segId === nid
+        && other.dist < reserved + (this.carLength(car) + this.carLength(other)) / 2 + 1.8) return false
     }
     return true
   }
@@ -1703,19 +2173,60 @@ export class TrafficSystem {
   /* ---------------- main update ---------------- */
   private signalColorTimer = 0
 
-  update(dt: number, playerPos: THREE.Vector3, night: number) {
+  /** Also called while paused, so dusk changes lights without moving traffic. */
+  updateLightAppearance(night: number) {
+    this.lightNight = night
+    const on = THREE.MathUtils.smoothstep(night, .05, .4)
+    this.headTint.setScalar(.15 + .85 * on)
+    for (const car of this.cars) {
+      const meshes = this.carMeshes[car.typeIdx]
+      if (!meshes) continue
+      meshes.lampF?.setColorAt(car.slot, this.headTint)
+      this.tailTint.setScalar(car.brakeHold > 0 ? 1 : .07 + .25 * on)
+      meshes.lampR?.setColorAt(car.slot, this.tailTint)
+    }
+    if (this.busMeshes) for (let i = 0; i < this.buses.length; i++) {
+      this.busMeshes.lampF.setColorAt(i, this.headTint)
+      this.tailTint.setScalar(this.buses[i].brakeHold > 0 ? 1 : .07 + .25 * on)
+      this.busMeshes.lampR.setColorAt(i, this.tailTint)
+    }
+    this.tailTint.setScalar(.07 + .25 * on)
+    for (const part of this.tramParts) for (const lamp of [part.lampF, part.lampR]) {
+      if (!lamp) continue
+      for (let i = 0; i < lamp.count; i++) lamp.setColorAt(i, lamp === part.lampF ? this.headTint : this.tailTint)
+    }
+    for (const meshes of [...this.carMeshes, this.busMeshes, ...this.tramParts]) {
+      if (!meshes) continue
+      for (const lamp of [meshes.lampF, meshes.lampR]) if (lamp?.instanceColor) lamp.instanceColor.needsUpdate = true
+    }
+  }
+
+  getHeadlampEmitters(): HeadlampEmitter[] {
+    const emitters = this.cars.flatMap((car, id) => {
+      const geometry = this.carMeshes[car.typeIdx]?.lampF?.geometry
+      return geometry ? [{ id, x: car.x, z: car.z, heading: car.heading, lamps: headlampAnchors(geometry) }] : []
+    })
+    if (this.busMeshes) {
+      const lamps = headlampAnchors(this.busMeshes.lampF.geometry)
+      this.buses.forEach((bus, i) => emitters.push({ id: MAX_TRAFFIC_VEHICLES + i, x: bus.x, z: bus.z, heading: bus.heading, lamps }))
+    }
+    return emitters
+  }
+
+  update(dt: number, playerPos: THREE.Vector3, night: number, writeCarMatrices = true) {
     this.playerX = playerPos.x
     this.playerZ = playerPos.z
+    this.router.sense(this.cars, this.simTime)
     this.updateSignals(dt)
-    this.updateCars(dt, night)
+    this.updateCars(dt, night, writeCarMatrices)
+    this.recordMetrics(dt)
     this.updateBuses(dt)
     this.updateTrams(dt)
     this.refreshSignalColors(dt)
-    this.streamTimer -= dt
-    if (this.streamTimer <= 0) {
-      this.streamTimer = 1.6
-      this.stream(playerPos)
-    }
+    this.updateLightAppearance(night)
+    // Every scenario represents a persistent network-wide population. Avoid
+    // camera-relative relocation so overview/spectator cameras do not rewrite
+    // demand or create/erase queues while the simulation runs.
   }
 
   private refreshSignalColors(dt: number) {
@@ -1727,19 +2238,22 @@ export class TrafficSystem {
     let li = 0
     for (const sg of this.network.signals) {
       const st = this.signalState.get(sg.id)
-      const axisNow = st && st.t > 0 ? sg.phases[st.phase]?.greenAxis : null
+      const phase = st && st.t > 0 ? sg.phases[st.phase] : null
+      const axisNow = phase?.movement !== 'left' ? phase?.greenAxis : null
       for (const h of sg.heads) {
         // the head's axis comes from the network data (NOT the loop index —
         // the old li%2 guess showed half the heads the wrong phase)
         const headAxis = h.axis
         const green = axisNow === headAxis ? '#2ecc40' : '#123a16'
-        const amber = axisNow === null ? '#ffdc00' : '#4a3a10'
-        sm.lampIM.setColorAt(li * 3 + 0, new THREE.Color(axisNow === headAxis ? '#3a1512' : st && st.t <= 0 ? '#b8a25a' : '#ff4136'))
+        const amber = '#4a3a10'
+        sm.lampIM.setColorAt(li * 3 + 0, new THREE.Color(axisNow === headAxis ? '#3a1512' : '#ff4136'))
         sm.lampIM.setColorAt(li * 3 + 1, new THREE.Color(amber))
         sm.lampIM.setColorAt(li * 3 + 2, new THREE.Color(green))
+        sm.arrowIM.setColorAt(li, new THREE.Color(phase?.movement === 'left' && phase.greenAxis === headAxis ? '#2ecc40' : '#123a16'))
         li++
       }
     }
     if (sm.lampIM.instanceColor) sm.lampIM.instanceColor.needsUpdate = true
+    if (sm.arrowIM.instanceColor) sm.arrowIM.instanceColor.needsUpdate = true
   }
 }

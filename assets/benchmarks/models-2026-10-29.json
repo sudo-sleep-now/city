@@ -1,0 +1,38 @@
+[
+  {
+    "kind": "architecture",
+    "version": "before",
+    "bytes": 1726904,
+    "meshes": 69,
+    "nodes": 80,
+    "materials": 10,
+    "triangles": 44364
+  },
+  {
+    "kind": "architecture",
+    "version": "after",
+    "bytes": 2046004,
+    "meshes": 78,
+    "nodes": 89,
+    "materials": 13,
+    "triangles": 49676
+  },
+  {
+    "kind": "vehicles",
+    "version": "before",
+    "bytes": 628848,
+    "meshes": 115,
+    "nodes": 299,
+    "materials": 8,
+    "triangles": 21786
+  },
+  {
+    "kind": "vehicles",
+    "version": "after",
+    "bytes": 477196,
+    "meshes": 20,
+    "nodes": 24,
+    "materials": 8,
+    "triangles": 16394
+  }
+]

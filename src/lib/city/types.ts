@@ -1,4 +1,5 @@
 import * as THREE from 'three'
+import type { TrafficConfig, TrafficMetrics } from './traffic-config'
 
 /* ============================================================
  * SOLHEIM — shared types. This file is the pinned contract
@@ -16,6 +17,7 @@ export interface RoadSpec {
   to: number
   cls: RoadClass
   pedestrianOnly?: boolean // car-free shopping street
+  transitOnly?: boolean // terminal drive, excluded from private car lane graph
 }
 
 export type ZoneKind =
@@ -213,6 +215,12 @@ export interface LaneSeg {
   cls: RoadClass
   speed: number // m/s
   next: string[] // ids of lane segs reachable at the downstream end
+  signalId?: string
+  /** Final destinations selected before entering a dedicated turn pocket. */
+  routeChoices?: string[]
+  pocket?: 'left' | 'through-right'
+  approachLane?: string
+  laneWidth?: number
 }
 
 export interface SidewalkSeg {
@@ -242,6 +250,7 @@ export interface CrosswalkSeg {
 export interface SignalPhase {
   greenAxis: 'x' | 'z'
   duration: number
+  movement?: 'through' | 'left'
 }
 
 export interface SignalGroup {
@@ -261,6 +270,8 @@ export interface ConnPath {
   len: number
   /** true when end and start are collinear (straight through-movement) */
   straight: boolean
+  /** Lane split upstream of a junction; excluded from junction throughput. */
+  internal?: boolean
 }
 
 export interface RoadNetworkData {
@@ -357,6 +368,9 @@ export interface EngineState {
   paused: boolean
   clock: number // hours 0..24
   fps: number
+  graphicsMode: import('./render-quality').QualityMode
+  graphicsLevel: import('./render-quality').QualityLevel
+  renderStats: { calls: number; triangles: number; pixelRatio: number }
   px: number
   pz: number
   heading: number // radians
@@ -365,10 +379,17 @@ export interface EngineState {
   nearby: NearbyInteraction | null
   activePoi: POI | null
   showStats: boolean
+  showTrafficLab: boolean
+  trafficConfig: TrafficConfig
+  trafficMetrics: TrafficMetrics
+  trafficPaused: boolean
+  trafficSpeed: 1 | 2 | 4
+  trafficView: 'street' | 'junction' | 'district'
   toast: string | null
   fade: boolean
   loadingProgress: number // 0..1
   tour: TourState | null
+  classroomMode: boolean // stable daylight, no weather or random incidents
   muted: boolean // ambient audio muted (M / HUD button)
 }
 

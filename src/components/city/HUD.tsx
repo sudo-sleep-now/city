@@ -2,6 +2,7 @@
 
 import { getEngine } from '@/lib/city/engine'
 import { useCityStore } from '@/lib/city/store'
+import GraphicsSettings from './GraphicsSettings'
 
 /** In-world HUD — owned by Task 2-e for polish. */
 export default function HUD() {
@@ -15,18 +16,19 @@ export default function HUD() {
   const activePoi = useCityStore((s) => s.activePoi)
   const tour = useCityStore((s) => s.tour)
   const muted = useCityStore((s) => s.muted)
+  const trafficLab = useCityStore((s) => s.showTrafficLab)
 
   const hh = Math.floor(clock)
   const mm = Math.floor((clock - hh) * 60)
   const isNight = clock < 6.5 || clock > 19
   const timeStr = `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`
 
-  const showPrompt = started && !paused && !showStats && !activePoi && nearby
+  const showPrompt = started && !paused && !showStats && !trafficLab && !activePoi && nearby
 
   return (
     <>
       {/* crosshair */}
-      {started && !paused && !showStats && !activePoi && (
+      {started && !paused && !showStats && !trafficLab && !activePoi && (
         <div className="pointer-events-none absolute left-1/2 top-1/2 z-20 -translate-x-1/2 -translate-y-1/2">
           <div className="h-1.5 w-1.5 rounded-full bg-white/80 shadow-[0_0_4px_rgba(0,0,0,0.8)]" />
         </div>
@@ -36,18 +38,23 @@ export default function HUD() {
       {started && (
         <div className="absolute left-4 top-4 z-20 rounded-lg bg-black/45 backdrop-blur px-3 py-2 border border-white/10">
           <div className="text-emerald-300 font-bold text-sm leading-none">SOLHEIM</div>
-          <div className="text-white/50 text-[10px] mt-0.5">optimal city · walkable demo</div>
+          <div className="text-white/50 text-[10px] mt-0.5">2050 pilot district · City D</div>
         </div>
       )}
 
+      {started && !trafficLab && !showStats && !activePoi && (
+        <button onClick={() => getEngine()?.toggleTrafficLab()} className="absolute left-4 top-[4.7rem] z-30 rounded-lg border border-amber-300/35 bg-black/65 px-3 py-2 text-xs font-semibold text-amber-100 backdrop-blur hover:bg-amber-950/80">Traffic lab <kbd className="ml-2 text-amber-300/70">P</kbd></button>
+      )}
+
       {/* bottom-left clock + sound toggle */}
+      {started && !showStats && !activePoi && <div className="absolute left-4 top-[7.4rem] z-30"><GraphicsSettings compact /></div>}
       {started && (
         <div className="absolute bottom-4 left-4 z-20 flex items-center gap-2">
-          <div className="rounded-lg bg-black/45 backdrop-blur px-3 py-2 border border-white/10 flex items-center gap-2">
+          <button type="button" aria-label={isNight ? 'Switch to daylight' : 'Switch to night lighting'} title="Switch day / night" onClick={() => getEngine()?.toggleDayNight()} className="rounded-lg bg-black/45 backdrop-blur px-3 py-2 border border-white/10 flex items-center gap-2 hover:bg-black/60">
             <span aria-hidden>{isNight ? '🌙' : '☀️'}</span>
             <span className="text-white/90 text-sm font-semibold tabular-nums">{timeStr}</span>
             <span className="text-white/40 text-[10px]">{fps} fps</span>
-          </div>
+          </button>
           <button
             type="button"
             aria-label={muted ? 'Unmute ambient sound' : 'Mute ambient sound'}
@@ -63,7 +70,7 @@ export default function HUD() {
       {/* bottom-right hints */}
       {started && !paused && (
         <div className="absolute bottom-4 right-4 z-20 rounded-lg bg-black/45 backdrop-blur px-3 py-2 border border-white/10 text-[11px] text-white/60">
-          <span><b className="text-white/90">T</b> tour</span>
+          <span><b className="text-white/90">T</b> site visit</span>
           <span className="mx-2 text-white/25">·</span>
           <span><b className="text-white/90">E</b> interact</span>
           <span className="mx-2 text-white/25">·</span>
@@ -93,7 +100,7 @@ export default function HUD() {
       )}
 
       {/* guided tour narration card */}
-      {tour && started && !paused && (
+      {tour && started && !paused && !trafficLab && (
         <div className="pointer-events-none absolute bottom-[9%] left-1/2 z-20 w-[min(660px,92vw)] -translate-x-1/2">
           <div className="rounded-xl border border-emerald-400/30 bg-black/70 backdrop-blur-md px-5 py-4 shadow-2xl">
             <div className="flex items-center justify-between gap-3">
@@ -119,8 +126,12 @@ export default function HUD() {
                 ))}
               </div>
             )}
+            <div className="pointer-events-auto mt-3 flex gap-2">
+              <button onClick={() => getEngine()?.previousTourStop()} disabled={tour.idx === 0} className="rounded border border-white/20 px-3 py-1 text-xs text-white/80 disabled:opacity-30">Previous</button>
+              <button onClick={() => getEngine()?.toggleTour()} className="rounded bg-emerald-400 px-3 py-1 text-xs font-semibold text-emerald-950">{tour.idx === tour.total - 1 ? "Finish visit" : "Next location"}</button>
+            </div>
             <div className="mt-2.5 text-[10px] text-white/40">
-              <b className="text-white/70">T</b> next stop · walk freely while you listen
+              <b className="text-white/70">T</b> next · <b className="text-white/70">Shift + T</b> previous · <b className="text-white/70">Q</b> finish · locations stay until you advance
             </div>
           </div>
         </div>

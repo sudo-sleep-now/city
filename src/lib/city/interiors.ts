@@ -480,7 +480,7 @@ export class InteriorManager {
       const board = new THREE.Mesh(new THREE.BoxGeometry(10, 2.6, 0.3), new THREE.MeshStandardMaterial({ color: '#1a201c', roughness: 0.5 }))
       board.position.set(cx, H - 2.6, cz - D / 2 + 0.6)
       group.add(board)
-      const boardText = new THREE.Mesh(new THREE.PlaneGeometry(9.4, 2.1), this.mats.signMaterial('T1 GREEN LINE — P1 — ON TIME · T2 SUN LINE — P2 — 2 MIN · B1 INNER — GATE A — ON TIME', { bg: '#10160f', fg: '#ffb84a', w: 1024, h: 224 }))
+      const boardText = new THREE.Mesh(new THREE.PlaneGeometry(9.4, 2.1), this.mats.signMaterial('B1 CITY LOOP — TO CITY CENTRE · B1 CITY LOOP — FROM CITY CENTRE · T1 TRAM — 150 M WALK', { bg: '#10160f', fg: '#ffb84a', w: 1024, h: 224 }))
       boardText.position.set(cx, H - 2.6, cz - D / 2 + 0.78)
       group.add(boardText)
       // big clock

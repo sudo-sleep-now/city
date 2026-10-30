@@ -1,0 +1,21 @@
+{
+  "source": "scripts/blender/street-props.py",
+  "editable_scene": "assets/blender/street-props.blend",
+  "export": "public/models/street-props.glb",
+  "bytes": 783500,
+  "sha256": "4f3537ea5ff1d6c9a2a16fdcd8a80d99d4e057488ab496c04a5ab5f3b92ee354",
+  "triangles": 16388,
+  "mesh_batches": 24,
+  "materials": 11,
+  "textures": 0,
+  "triangles_by_root": {
+    "bike_rack": 876,
+    "hydrant": 2776,
+    "litter_bin": 2140,
+    "parked_bike": 4712,
+    "station_bench": 1932,
+    "stop_shelter": 2380,
+    "ticket_kiosk": 1572
+  },
+  "render": "assets/previews/street-details.png"
+}

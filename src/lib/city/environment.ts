@@ -2,8 +2,12 @@ import * as THREE from 'three'
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js'
 import { GARBAGE_SPOTS, GRID_LINES, SIDEWALK_HEIGHT, SIDEWALK_WIDTH, lineClass } from './constants'
 import { roadHalfWidth } from './planner'
+import { createMobilityInfrastructure } from './mobility'
 import { getBinGrimeTexture, getFenceMaterial, getPitchMaterial, canvas, tex, worldUVPlane, worldUVBox } from './materials'
 import type { AABB, CityMaterials, CityPlan, RoadClass } from './types'
+import type { ModelLibrary } from './models'
+import { addPropInstances, type PropPlacement } from './authored-props'
+import { createCityCenter } from './city-center'
 
 /* ============================================================
  * Environment: trees, park contents, street furniture, shelters,
@@ -34,7 +38,7 @@ function mulberry32(seed: number) {
   }
 }
 
-export function createEnvironment(plan: CityPlan, mats: CityMaterials): EnvironmentResult {
+export function createEnvironment(plan: CityPlan, mats: CityMaterials, models: ModelLibrary = new Map()): EnvironmentResult {
   const group = new THREE.Group()
   const colliders: AABB[] = []
   const streetLights: THREE.Vector3[] = []
@@ -43,6 +47,13 @@ export function createEnvironment(plan: CityPlan, mats: CityMaterials): Environm
   const stopSpots: { stopId: string; x: number; z: number; ry: number }[] = []
   const animators: ((t: number) => void)[] = []
   const rng = mulberry32(424242)
+  const decalMaterial = <T extends THREE.Material>(source: T): T => {
+    const material = source.clone()
+    material.polygonOffset = true
+    material.polygonOffsetFactor = -1
+    material.polygonOffsetUnits = -1
+    return material
+  }
 
   /* ---------- helpers ---------- */
   const dummy = new THREE.Object3D()
@@ -100,6 +111,7 @@ export function createEnvironment(plan: CityPlan, mats: CityMaterials): Environm
   const corridorHalf = (cls: RoadClass, coord: number) => roadHalfWidth(cls, coord) + SIDEWALK_WIDTH[cls] + 0.7
   /** true if (x,z) lies inside ANY street corridor incl. its sidewalks */
   const inCorridor = (x: number, z: number): boolean => {
+    if (x > 22 && x < 101 && z > -133 && z < -100) return true
     for (const r of plan.roads) {
       const m = corridorHalf(r.cls, r.coord)
       if (r.axis === 'x') {
@@ -213,7 +225,7 @@ export function createEnvironment(plan: CityPlan, mats: CityMaterials): Environm
 
   // street trees along arterials & collectors (both sides), locals alternating
   for (const road of plan.roads) {
-    if (road.pedestrianOnly) continue
+    if (road.pedestrianOnly || road.transitOnly) continue
     const hw = roadHalfWidth(road.cls, road.coord)
     const spacing = road.cls === 'local' ? 32 : 24
     for (let pos = road.from + 14; pos < road.to - 14; pos += spacing) {
@@ -225,7 +237,7 @@ export function createEnvironment(plan: CityPlan, mats: CityMaterials): Environm
         if (nearIntersection(road.axis === 'x' ? pos : road.coord, road.axis === 'x' ? road.coord : pos, 11)) continue
         if (nearCrosswalk(x, z)) continue
         // keep the station forecourt clear
-        if (x > 14 && x < 86 && z < -94 && z > -138) continue
+        if (x > 14 && x < 101 && z < -94 && z > -138) continue
         // Fire Station 1 forecourt (330,-27) — no street trees in the pull-out
         if (x > 300 && x < 362 && z > -14 && z < 0) continue
         addTree(x, z, road.cls !== 'local' && rng() < 0.3)
@@ -303,8 +315,16 @@ export function createEnvironment(plan: CityPlan, mats: CityMaterials): Environm
   const NI = (g: THREE.BufferGeometry) => (g.index ? g.toNonIndexed() : g)
   const jitter = (geo: THREE.BufferGeometry, j: number) => {
     const p = geo.attributes.position
+    const vertices = new Map<string, [number, number, number]>()
     for (let i = 0; i < p.count; i++) {
-      p.setXYZ(i, p.getX(i) + (rng() - 0.5) * j, p.getY(i) + (rng() - 0.5) * j, p.getZ(i) + (rng() - 0.5) * j)
+      const x = p.getX(i), y = p.getY(i), z = p.getZ(i)
+      // Non-indexed geometry repeats a vertex for each adjoining face. Moving
+      // those copies independently tears the canopy into disconnected shards.
+      const key = `${Math.round(x * 1e5)},${Math.round(y * 1e5)},${Math.round(z * 1e5)}`
+      // Consume the same random stream as before to preserve city placements.
+      const candidate: [number, number, number] = [x + (rng() - .5) * j, y + (rng() - .5) * j, z + (rng() - .5) * j]
+      if (!vertices.has(key)) vertices.set(key, candidate)
+      p.setXYZ(i, ...vertices.get(key)!)
     }
     geo.computeVertexNormals()
     return geo
@@ -366,6 +386,7 @@ export function createEnvironment(plan: CityPlan, mats: CityMaterials): Environm
   )
   // BIRCH — slender white stem, small airy crown
   const canopyBirch = mergeParts([blob(1.05, 0, 4.35, 0), blob(0.85, 0.55, 3.9, 0.4), blob(0.8, -0.5, 4.6, -0.3)], 0.2)
+  for (const canopy of [canopyOakA, canopyOakB, canopyLinden, canopyBirch]) canopy.name = 'Closed broadleaf canopy'
   const trunkBirch = mergeParts(
     [NI(new THREE.CylinderGeometry(0.09, 0.16, 3.6, 7)).translate(0, 1.8, 0), limb(0.045, 0.9, 2.6, 0.9, 0.7), limb(0.04, 0.8, 3.0, 0.85, 3.9)],
     0,
@@ -421,7 +442,7 @@ export function createEnvironment(plan: CityPlan, mats: CityMaterials): Environm
   // --- streetlights (cobra-head: pole on the curb, arm reaching over the road) ---
   const slItems: { x: number; z: number; ry: number }[] = []
   for (const road of plan.roads) {
-    if (road.pedestrianOnly) continue
+    if (road.pedestrianOnly || road.transitOnly) continue
     const hw = roadHalfWidth(road.cls, road.coord)
     for (let pos = road.from + 15; pos < road.to - 15; pos += 30) {
       for (const s of [-1, 1]) {
@@ -446,9 +467,9 @@ export function createEnvironment(plan: CityPlan, mats: CityMaterials): Environm
   // --- benches ---
   const benchWood: { x: number; y: number; z: number; ry: number }[] = []
   const benchMetal: { x: number; y: number; z: number; ry: number }[] = []
-  const addBench = (x: number, z: number, ry: number) => {
-    benchWood.push({ x, y: 0.48, z, ry })
-    benchMetal.push({ x, y: 0.22, z, ry })
+  const addBench = (x: number, z: number, ry: number, base = 0) => {
+    benchWood.push({ x, y: base + 0.48, z, ry })
+    benchMetal.push({ x, y: base + 0.22, z, ry })
     benchSpots.push({ x, z, ry })
   }
   // central park benches at the four path-node plazas + pond + playground
@@ -459,8 +480,14 @@ export function createEnvironment(plan: CityPlan, mats: CityMaterials): Environm
   }
   addBench(-73, -349, Math.PI) // pond overlook
   addBench(-64, -224, 0) // playground
-  // plaza benches
-  for (const [bx, bz, br] of [[20, -40, 0], [60, -40, 0], [20, -60, Math.PI], [60, -60, Math.PI], [40, -20, 0]] as const) addBench(bx, bz, br)
+  // The square's seating shares the same authored batch and pedestrian spots
+  // as the rest of the district.
+  const center = createCityCenter(mats, models)
+  group.add(center.group)
+  colliders.push(...center.colliders)
+  streetLights.push(...center.streetLights)
+  if (center.animated) animators.push(center.animated)
+  for (const seat of center.seats) addBench(seat.x, seat.z, seat.ry, seat.base ?? 0)
   // pocket park benches
   for (const p of plan.parks) {
     if (p.kind !== 'pocket-park') continue
@@ -478,20 +505,6 @@ export function createEnvironment(plan: CityPlan, mats: CityMaterials): Environm
   addBench(-55, 325, 0)
   addBench(-45, 375, Math.PI)
   addBench(-55, 375, Math.PI)
-  makeIM(
-    mergeGeometries([new THREE.BoxGeometry(1.8, 0.07, 0.45), new THREE.BoxGeometry(1.8, 0.5, 0.06).translate(0, 0.3, -0.22)], false)!,
-    mats.wood,
-    benchWood,
-  )
-  makeIM(
-    mergeGeometries(
-      [new THREE.BoxGeometry(0.06, 0.44, 0.4).translate(-0.8, 0, 0), new THREE.BoxGeometry(0.06, 0.44, 0.4).translate(0.8, 0, 0)],
-      false,
-    )!,
-    mats.metalDark,
-    benchMetal,
-  )
-
   // --- trash, bike racks & bus shelters (shelters attach their trash + racks) ---
   const trash: { x: number; y: number; z: number }[] = []
   const rackGeo = mergeGeometries(
@@ -500,17 +513,24 @@ export function createEnvironment(plan: CityPlan, mats: CityMaterials): Environm
   )!
   const racks: { x: number; y: number; z: number; ry: number }[] = []
   const bikes: { x: number; y: number; z: number; ry: number }[] = []
-  const addRack = (x: number, z: number, ry: number) => {
+  const addRack = (x: number, z: number, ry: number, base = SIDEWALK_HEIGHT) => {
     for (let i = 0; i < 4; i++) {
       const ox = (i - 1.5) * 0.9
-      racks.push({ x: x + Math.cos(ry) * ox, y: 0, z: z - Math.sin(ry) * ox, ry })
-      if (rng() < 0.55) bikes.push({ x: x + Math.cos(ry) * ox + 0.4, y: 0, z: z - Math.sin(ry) * ox, ry: ry + Math.PI / 2 + (rng() - 0.5) * 0.3 })
+      racks.push({ x: x + Math.cos(ry) * ox, y: base, z: z - Math.sin(ry) * ox, ry })
+      // Wheelbase follows the rack's long axis; offset beside its tube rather
+      // than crossing the next rack or adding an unrotated world-X offset.
+      if (rng() < 0.55) bikes.push({ x: x + Math.cos(ry) * (ox + 0.18), y: base, z: z - Math.sin(ry) * (ox + 0.18), ry: ry + (rng() - 0.5) * 0.06 })
     }
   }
   const shelterRoof: { x: number; y: number; z: number; ry: number }[] = []
   const shelterBack: { x: number; y: number; z: number; ry: number }[] = []
   const shelterPost: { x: number; y: number; z: number }[] = []
+  const shelters: PropPlacement[] = []
   for (const s of plan.stops) {
+    if (s.name.startsWith('Solheim Interchange')) {
+      stopSpots.push({ stopId: s.id, x: 51, z: -130.5, ry: 0 })
+      continue // the station has a dedicated accessible boarding shelter
+    }
     if (s.mode !== 'bus') continue
     // travel direction from the first route serving this stop
     let dx = 0
@@ -552,31 +572,48 @@ export function createEnvironment(plan: CityPlan, mats: CityMaterials): Environm
     const side = bestRoad.axis === 'x' ? (dx >= 0 ? 1 : -1) : dz >= 0 ? -1 : 1
     let bx = bestRoad.axis === 'x' ? s.x : bestRoad.coord + side * hw
     let bz = bestRoad.axis === 'x' ? bestRoad.coord + side * hw : s.z
-    // nudge along the travel direction until clear of every road corridor
-    for (let n = 0; n < 14 && distToRoadCorridor(bx, bz) < 0.5; n++) {
+    const ry = bestRoad.axis === 'x' ? (side > 0 ? 0 : Math.PI) : side > 0 ? Math.PI / 2 : -Math.PI / 2
+    // Check the whole shelter/rack/bin envelope, not just its centre, before
+    // nudging it away from a crossing street.
+    const clearStop = () => [-6.2, 3.05].every(lx => [-1, 1].every(lz =>
+      distToRoadCorridor(bx + Math.cos(ry) * lx + Math.sin(ry) * lz, bz - Math.sin(ry) * lx + Math.cos(ry) * lz) >= .3))
+    for (let n = 0; n < 14 && !clearStop(); n++) {
       bx += dx * 2
       bz += dz * 2
     }
-    if (distToRoadCorridor(bx, bz) < 0.3) continue // never leave furniture on the asphalt
-    const ry = bestRoad.axis === 'x' ? (side > 0 ? 0 : Math.PI) : side > 0 ? Math.PI / 2 : -Math.PI / 2
-    shelterRoof.push({ x: bx, y: 2.45, z: bz, ry })
-    shelterBack.push({ x: bx - Math.sin(ry) * 0.55, y: 1.15, z: bz - Math.cos(ry) * 0.55, ry })
-    shelterPost.push({ x: bx - Math.sin(ry) * 1.6, y: 1.2, z: bz - Math.cos(ry) * 1.6 })
-    shelterPost.push({ x: bx + Math.sin(ry) * 1.6, y: 1.2, z: bz + Math.cos(ry) * 1.6 })
-    addBench(bx, bz - Math.cos(ry) * 0.2, ry + Math.PI)
-    trash.push({ x: bx + Math.cos(ry) * 2.7, y: 0.45, z: bz - Math.sin(ry) * 2.7 })
-    addRack(bx - Math.cos(ry) * 3.6, bz + Math.sin(ry) * 3.6, ry)
-    stopSpots.push({ stopId: s.id, x: bx, z: bz, ry })
+    if (!clearStop()) continue
+    shelters.push({ x: bx, y: SIDEWALK_HEIGHT, z: bz, ry })
+    shelterRoof.push({ x: bx, y: SIDEWALK_HEIGHT + 2.45, z: bz, ry })
+    shelterBack.push({ x: bx + Math.sin(ry) * 0.65, y: SIDEWALK_HEIGHT + 1.15, z: bz + Math.cos(ry) * 0.65, ry })
+    for (const dx of [-1.9, 1.9]) shelterPost.push({ x: bx + Math.cos(ry) * dx + Math.sin(ry) * .65, y: SIDEWALK_HEIGHT + 1.2, z: bz - Math.sin(ry) * dx + Math.cos(ry) * .65 })
+    addBench(bx + Math.sin(ry) * 0.27, bz + Math.cos(ry) * 0.27, ry + Math.PI, SIDEWALK_HEIGHT)
+    trash.push({ x: bx + Math.cos(ry) * 2.7, y: SIDEWALK_HEIGHT + 0.45, z: bz - Math.sin(ry) * 2.7 })
+    addRack(bx - Math.cos(ry) * 4.2, bz + Math.sin(ry) * 4.2, ry)
+    const nameplate = new THREE.Mesh(new THREE.PlaneGeometry(3.4, 0.28), mats.signMaterial(`${s.routeIds.join(' / ')}  ·  ${s.name}`, { bg: '#203e36', fg: '#f5f0dc', w: 768, h: 80 }))
+    nameplate.position.set(bx - Math.sin(ry) * .86, SIDEWALK_HEIGHT + 2.37, bz - Math.cos(ry) * .86)
+    nameplate.rotation.y = ry + Math.PI
+    group.add(nameplate)
+    stopSpots.push({ stopId: s.id, x: bx, z: bz, ry: ry + Math.PI })
   }
-  makeIM(new THREE.BoxGeometry(4.4, 0.12, 1.7), mats.metal, shelterRoof, undefined, false)
-  makeIM(new THREE.BoxGeometry(4.0, 2.2, 0.1), mats.glassDark, shelterBack, undefined, false)
-  makeIM(new THREE.CylinderGeometry(0.06, 0.06, 2.4, 6), mats.metalDark, shelterPost, undefined, false)
+  if (!addPropInstances(group, models, 'stop_shelter', shelters)) {
+    makeIM(new THREE.BoxGeometry(4.4, 0.12, 1.7), mats.metal, shelterRoof, undefined, false)
+    makeIM(new THREE.BoxGeometry(4.0, 2.2, 0.1), mats.glassDark, shelterBack, undefined, false)
+    makeIM(new THREE.CylinderGeometry(0.06, 0.06, 2.4, 6), mats.metalDark, shelterPost, undefined, false)
+  }
+  // Build seating after adding the stop benches, so every waiting area gets
+  // the same real seat that pedestrians can use.
+  if (!addPropInstances(group, models, 'station_bench', benchWood.map(p => ({ ...p, y: p.y - .48, ry: p.ry + Math.PI, sx: .75 })))) {
+    makeIM(mergeGeometries([new THREE.BoxGeometry(1.8, 0.07, 0.45), new THREE.BoxGeometry(1.8, 0.5, 0.06).translate(0, 0.3, -0.22)], false)!, mats.wood, benchWood)
+    makeIM(mergeGeometries([new THREE.BoxGeometry(0.06, 0.44, 0.4).translate(-0.8, 0, 0), new THREE.BoxGeometry(0.06, 0.44, 0.4).translate(0.8, 0, 0)], false)!, mats.metalDark, benchMetal)
+  }
 
   // --- trash cans (fixed spots; stop-side cans are added by the shelter loop) ---
   for (const [tx, tz] of [[-18, -306], [42, -294], [30, -50], [70, -50], [13, -105], [-30, 100], [30, 200], [-50, 350], [250, 240], [106, -120]] as const) {
     trash.push({ x: tx, y: 0.45, z: tz })
   }
-  makeIM(new THREE.CylinderGeometry(0.28, 0.24, 0.8, 8), mats.black, trash, undefined, false)
+  if (!addPropInstances(group, models, 'litter_bin', trash.map(p => ({ ...p, y: p.y - .45 })))) {
+    makeIM(new THREE.CylinderGeometry(0.28, 0.24, 0.8, 8), mats.black, trash, undefined, false)
+  }
 
   // --- bollards (car-free street gates + plaza corners) ---
   const bollards: { x: number; y: number; z: number }[] = []
@@ -596,7 +633,7 @@ export function createEnvironment(plan: CityPlan, mats: CityMaterials): Environm
   //     at y=0.35 and glowed: neonRed emissive) ---
   const hydrants: { x: number; y: number; z: number; ry: number }[] = []
   for (const road of plan.roads) {
-    if (road.pedestrianOnly) continue
+    if (road.pedestrianOnly || road.transitOnly) continue
     const hw = roadHalfWidth(road.cls, road.coord)
     const off = hw + 0.9 // against the curb, fully on the sidewalk (SW ≥ 3.5)
     let n = 0
@@ -606,13 +643,13 @@ export function createEnvironment(plan: CityPlan, mats: CityMaterials): Environm
       const z = road.axis === 'x' ? road.coord + side * off : pos
       if (nearIntersection(x, z, 12)) continue
       if (nearCrosswalk(x, z, 4.5)) continue
-      if (x > 14 && x < 86 && z < -94 && z > -138) continue // station forecourt
+      if (x > 14 && x < 101 && z < -94 && z > -138) continue // station forecourt
       if (x > 300 && x < 362 && z > -12 && z < 0) continue // Fire Station 1 apron
       if (stopSpots.some((s) => Math.hypot(s.x - x, s.z - z) < 3.5)) continue // keep stops clear
       hydrants.push({ x, y: SIDEWALK_HEIGHT, z, ry: rng() * Math.PI * 2 })
     }
   }
-  if (hydrants.length) {
+  if (hydrants.length && !addPropInstances(group, models, 'hydrant', hydrants)) {
     const hydrantRedMat = new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.52, metalness: 0.22 })
     const hydrantBrassMat = new THREE.MeshStandardMaterial({ color: '#9c7c33', roughness: 0.38, metalness: 0.82 })
     const hRed = new THREE.Color('#a8322a')
@@ -646,46 +683,53 @@ export function createEnvironment(plan: CityPlan, mats: CityMaterials): Environm
     )!
     makeIM(hydrantBodyGeo, hydrantRedMat, hydrants, (i) => new THREE.Color(hRed).offsetHSL(0, 0, ((i * 13) % 5) * 0.012), true)
     makeIM(hydrantBrassGeo, hydrantBrassMat, hydrants, undefined, false)
-    for (const h of hydrants) colliders.push({ minX: h.x - 0.24, maxX: h.x + 0.24, minZ: h.z - 0.24, maxZ: h.z + 0.24, h: 1 })
   }
+  for (const h of hydrants) colliders.push({ minX: h.x - 0.34, maxX: h.x + 0.34, minZ: h.z - 0.34, maxZ: h.z + 0.34, h: 1.1 })
 
   // --- bike racks + bicycles (declared above; fixed placements here) ---
-  addRack(-20, -20, Math.PI / 2) // plaza
-  addRack(-80, -30, 0) // market front
-  for (const [sx, sz] of [[-252, -266], [252, -266], [-252, 338]]) addRack(sx + 20, sz + 22, 0)
-  makeIM(rackGeo, mats.metalDark, racks, undefined, false)
-  const bikeGeo = mergeGeometries(
-    [
-      new THREE.TorusGeometry(0.34, 0.035, 6, 14).rotateY(Math.PI / 2).translate(0, 0.34, 0.42),
-      new THREE.TorusGeometry(0.34, 0.035, 6, 14).rotateY(Math.PI / 2).translate(0, 0.34, -0.42),
-      new THREE.BoxGeometry(0.05, 0.05, 0.9).translate(0, 0.55, 0),
-      new THREE.BoxGeometry(0.05, 0.4, 0.05).translate(0, 0.42, -0.5),
-      new THREE.BoxGeometry(0.05, 0.05, 0.4).translate(0, 0.8, -0.55),
-    ],
-    false,
-  )!
-  makeIM(bikeGeo, mats.metalDark, bikes, (i) => new THREE.Color(['#c94f3d', '#4a8c5c', '#d8a832', '#9a9da1'][i % 4]), false)
+  addRack(-20, -20, Math.PI / 2, 0) // block paving is at ground level
+  addRack(-80, -30, 0, 0) // market front
+  for (const [sx, sz] of [[-252, -266], [252, -266], [-252, 338]]) addRack(sx + 20, sz + 22, 0, 0)
+  if (!addPropInstances(group, models, 'bike_rack', racks)) makeIM(rackGeo, mats.metalDark, racks, undefined, false)
+  else rackGeo.dispose()
+  if (!addPropInstances(group, models, 'parked_bike', bikes)) {
+    const bikeGeo = mergeGeometries(
+      [
+        new THREE.TorusGeometry(0.34, 0.035, 6, 14).rotateY(Math.PI / 2).translate(0, 0.34, 0.42),
+        new THREE.TorusGeometry(0.34, 0.035, 6, 14).rotateY(Math.PI / 2).translate(0, 0.34, -0.42),
+        new THREE.BoxGeometry(0.05, 0.05, 0.9).translate(0, 0.55, 0),
+        new THREE.BoxGeometry(0.05, 0.4, 0.05).translate(0, 0.42, -0.5),
+        new THREE.BoxGeometry(0.05, 0.05, 0.4).translate(0, 0.8, -0.55),
+      ], false,
+    )!
+    makeIM(bikeGeo, mats.metalDark, bikes, (i) => new THREE.Color(['#c94f3d', '#4a8c5c', '#d8a832', '#9a9da1'][i % 4]), false)
+  }
 
   // --- tram stop platforms + canopies ---
-  // T1 runs along x=0 (platform flanks east of the track),
-  // T2 runs along z=0 (platform flanks south of the track).
+  // Curbside waiting areas, with the existing junction crossings providing
+  // access towards the central tracks. The former 4.2 m islands occupied the
+  // car lane; furniture belongs beyond the cycle strip on the pavement.
   const platformGeos: THREE.BufferGeometry[] = []
   const canopyPosts: { x: number; y: number; z: number }[] = []
   const canopyRoofs: { x: number; y: number; z: number; ry: number }[] = []
+  const tramShelters: PropPlacement[] = []
+  const tramBenches: PropPlacement[] = []
   for (const s of plan.stops) {
     if (s.mode !== 'tram') continue
     const isT1 = s.routeIds.includes('T1')
     const isT2 = s.routeIds.includes('T2')
     if (!isT1 && !isT2) continue
-    // platform center: 4.2 m from track centerline — clear of the near
-    // double-track (trams run at ±1.6 m, body half-width 1.15 → near edge 2.75)
-    const cx = isT1 ? 4.2 : s.x
-    const cz = isT1 ? s.z : 4.2
+    const curb = roadHalfWidth('arterial', 0)
+    const cx = isT1 ? curb + 2.5 : s.x
+    const cz = isT1 ? s.z : curb + 2.5
     const alongX = isT2 // platform long axis
-    const plat = new THREE.BoxGeometry(alongX ? 9 : 2.2, 0.28, alongX ? 2.2 : 9)
-    plat.translate(cx, 0.14, cz)
+    const plat = new THREE.BoxGeometry(alongX ? 9 : 2.2, .02, alongX ? 2.2 : 9)
+    plat.translate(cx, SIDEWALK_HEIGHT, cz)
     platformGeos.push(plat)
     canopyRoofs.push({ x: cx, y: 2.8, z: cz, ry: alongX ? 0 : Math.PI / 2 })
+    const ry = alongX ? 0 : Math.PI / 2
+    tramShelters.push({ x: cx, y: SIDEWALK_HEIGHT + .01, z: cz, ry, sx: 5.4 / 4.4 })
+    tramBenches.push({ x: cx + Math.sin(ry) * .27, y: SIDEWALK_HEIGHT + .01, z: cz + Math.cos(ry) * .27, ry })
     canopyPosts.push({ x: cx + (alongX ? 3.4 : 0), y: 1.4, z: cz + (alongX ? 0 : 3.4) })
     canopyPosts.push({ x: cx - (alongX ? 3.4 : 0), y: 1.4, z: cz - (alongX ? 0 : 3.4) })
     // sign on the platform end
@@ -694,21 +738,25 @@ export function createEnvironment(plan: CityPlan, mats: CityMaterials): Environm
     const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, 3, 6), mats.metalDark)
     pole.position.set(sx2, 1.5, sz2)
     group.add(pole)
-    const board = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.5, 0.08), mats.neonAmber)
+    const board = new THREE.Mesh(new THREE.BoxGeometry(1.35, 0.5, 0.08), mats.metalDark)
     board.position.set(sx2, 3.1, sz2)
+    board.rotation.y = ry + Math.PI
     group.add(board)
+    const face = new THREE.Mesh(new THREE.PlaneGeometry(1.3, .44), mats.signMaterial(`${s.routeIds.join(' / ')}  TRAM`, { bg: '#203e36', fg: '#f5f0dc', w: 320, h: 96 }))
+    face.position.copy(board.position).add(new THREE.Vector3(0, 0, .05).applyAxisAngle(new THREE.Vector3(0, 1, 0), board.rotation.y))
+    face.rotation.copy(board.rotation)
+    group.add(face)
   }
   addMerged(platformGeos, mats.concreteLight, false)
-  makeIM(new THREE.BoxGeometry(5.4, 0.1, 2.0), mats.fabricGreen, canopyRoofs, undefined, false)
-  makeIM(new THREE.CylinderGeometry(0.06, 0.06, 2.8, 6), mats.metalDark, canopyPosts, undefined, false)
+  if (!addPropInstances(group, models, 'stop_shelter', tramShelters)) {
+    makeIM(new THREE.BoxGeometry(5.4, 0.1, 2.0), mats.fabricGreen, canopyRoofs, undefined, false)
+    makeIM(new THREE.CylinderGeometry(0.06, 0.06, 2.8, 6), mats.metalDark, canopyPosts, undefined, false)
+  }
+  addPropInstances(group, models, 'station_bench', tramBenches)
 
   // --- planters (plaza + ped street) ---
   const planterBoxes: { x: number; y: number; z: number }[] = []
   const bushes: { x: number; y: number; z: number; s: number }[] = []
-  for (const [px, pz] of [[12, -12], [12, -88], [88, -88], [40, -70], [60, -30], [88, -30]] as const) {
-    planterBoxes.push({ x: px, y: 0.3, z: pz })
-    bushes.push({ x: px, y: 0.75, z: pz, s: 0.55 })
-  }
   for (let x = -180; x <= 180; x += 26) {
     planterBoxes.push({ x, y: 0.3, z: 95.5 })
     bushes.push({ x, y: 0.75, z: 95.5, s: 0.5 })
@@ -731,7 +779,7 @@ export function createEnvironment(plan: CityPlan, mats: CityMaterials): Environm
     addLantern(nx + 7.5, nz + 7.5)
   }
   // civic plaza + pedestrian street
-  for (const [lx, lz] of [[20, -20], [80, -20], [20, -80], [80, -80], [40, -50], [62, -50], [-20, 96.5], [20, 96.5], [-60, 103.5], [60, 103.5]] as const) addLantern(lx, lz)
+  for (const [lx, lz] of [[-20, 96.5], [20, 96.5], [-60, 103.5], [60, 103.5]] as const) addLantern(lx, lz)
   makeIM(
     mergeGeometries(
       [
@@ -925,7 +973,7 @@ export function createEnvironment(plan: CityPlan, mats: CityMaterials): Environm
   }
   // circular node plazas where the paths cross (one per quadrant)
   for (const [nx, nz] of [[-55, -345], [55, -345], [-55, -255], [55, -255]] as const) {
-    const node = new THREE.Mesh(worldUVPlane(new THREE.CircleGeometry(4.6, 22), 9.2, 9.2, 3), mats.parkPath)
+    const node = new THREE.Mesh(worldUVPlane(new THREE.CircleGeometry(4.6, 22), 9.2, 9.2, 3), decalMaterial(mats.parkPath))
     node.rotation.x = -Math.PI / 2
     node.position.set(nx, 0.052, nz)
     group.add(node)
@@ -1012,8 +1060,10 @@ export function createEnvironment(plan: CityPlan, mats: CityMaterials): Environm
   }
   makeIM(new THREE.BoxGeometry(1.0, 0.24, 1.0), mats.planter, flowerBeds, undefined, false)
   makeIM(new THREE.SphereGeometry(0.09, 6, 5), new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.8 }), blooms, (i) => new THREE.Color(['#d84a3a', '#e8a03a', '#e8e0d0', '#c94f7c'][i % 4]), false)
-  addMerged(pathGeos, mats.parkPath, false)
-  addMerged(lawnGeos, mats.grassDark, false)
+  // Park paths and lawn patches intentionally cover the block base surface.
+  // Keep those overlays ahead in depth without changing shared materials.
+  addMerged(pathGeos, decalMaterial(mats.parkPath), false)
+  addMerged(lawnGeos, decalMaterial(mats.grassDark), false)
 
   // ---- Pocket parks: cross paths + seesaw ----
   for (const p of plan.parks) {
@@ -1036,12 +1086,12 @@ export function createEnvironment(plan: CityPlan, mats: CityMaterials): Environm
 
   // ---- Sports park ----
   {
-    const pitch = new THREE.Mesh(new THREE.PlaneGeometry(60, 38), getPitchMaterial())
+    const pitch = new THREE.Mesh(new THREE.PlaneGeometry(60, 38), decalMaterial(getPitchMaterial()))
     pitch.rotation.x = -Math.PI / 2
     pitch.position.set(-50, 0.04, 350)
     pitch.receiveShadow = true
     group.add(pitch)
-    const lineMat = mats.roadLine
+    const lineMat = decalMaterial(mats.roadLine)
     const lines: [number, number, number, number][] = [
       [-50, 331.2, 60, 0.2], [-50, 368.8, 60, 0.2], [-80.1, 350, 0.2, 38], [-19.9, 350, 0.2, 38], [-50, 350, 0.2, 38],
     ]
@@ -1067,7 +1117,7 @@ export function createEnvironment(plan: CityPlan, mats: CityMaterials): Environm
       group.add(bar)
     }
     // multi-use court
-    const court = new THREE.Mesh(worldUVPlane(new THREE.PlaneGeometry(22, 13), 22, 13, 6), mats.asphaltRough)
+    const court = new THREE.Mesh(worldUVPlane(new THREE.PlaneGeometry(22, 13), 22, 13, 6), decalMaterial(mats.asphaltRough))
     court.rotation.x = -Math.PI / 2
     court.position.set(-25, 0.04, 316)
     group.add(court)
@@ -1075,7 +1125,7 @@ export function createEnvironment(plan: CityPlan, mats: CityMaterials): Environm
     courtLine.rotation.x = -Math.PI / 2
     courtLine.scale.set(0.985, 0.985, 1)
     courtLine.position.set(-25, 0.06, 316)
-    courtLine.material = new THREE.MeshBasicMaterial({ color: '#c9a437', wireframe: true })
+    courtLine.material = decalMaterial(new THREE.MeshBasicMaterial({ color: '#c9a437', wireframe: true }))
     group.add(courtLine)
   }
 
@@ -1115,124 +1165,7 @@ export function createEnvironment(plan: CityPlan, mats: CityMaterials): Environm
     for (let r = 0; r < 5; r++) pathPlane(250, 222 + r * 14, 80, 1.6)
   }
 
-  // ---- Plaza paving (kept clear of the surrounding road corridors) ----
-  {
-    const pave = new THREE.Mesh(new THREE.PlaneGeometry(85.4, 82.9), mats.concreteLight)
-    pave.rotation.x = -Math.PI / 2
-    pave.position.set(53.3, 0.02, -52.05)
-    pave.receiveShadow = true
-    group.add(pave)
-    const band = new THREE.Mesh(new THREE.PlaneGeometry(72, 4), mats.planter)
-    band.rotation.x = -Math.PI / 2
-    band.position.set(50, 0.04, -50)
-    group.add(band)
-    // sculpture: 3 interlocking arcs on plinth
-    const plinth = new THREE.Mesh(new THREE.CylinderGeometry(2.2, 2.6, 0.8, 16), mats.concrete)
-    plinth.position.set(50, 0.4, -50)
-    plinth.castShadow = true
-    group.add(plinth)
-    const arcColors = [mats.metal, mats.fabricGreen, mats.fabricOrange]
-    for (let i = 0; i < 3; i++) {
-      const R = 1.6 + i * 0.25
-      const arcLen = Math.PI * 1.4
-      // torus arc + spherical end caps so the rods have no open holes
-      const arcParts: THREE.BufferGeometry[] = [new THREE.TorusGeometry(R, 0.12, 10, 28, arcLen)]
-      for (const a of [0, arcLen]) {
-        const cap = new THREE.SphereGeometry(0.125, 8, 6)
-        cap.translate(Math.cos(a) * R, Math.sin(a) * R, 0)
-        arcParts.push(cap)
-      }
-      const arcMerged = mergeGeometries(arcParts, false)
-      if (!arcMerged) continue
-      const arc = new THREE.Mesh(arcMerged, arcColors[i])
-      arc.position.set(50, 2.2 + i * 0.15, -50)
-      arc.rotation.y = (i * Math.PI) / 3
-      arc.rotation.x = 0.2 * i
-      arc.castShadow = true
-      group.add(arc)
-    }
-    colliders.push({ minX: 47.4, maxX: 52.6, minZ: -52.6, maxZ: -47.4, h: 1.2 })
-    // flag pole (moved onto the plaza paving, off the arterial sidewalk)
-    const fp = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.09, 11, 8), mats.metal)
-    fp.position.set(19, 5.5, -19)
-    fp.castShadow = true
-    group.add(fp)
-    const flag = new THREE.Mesh(new THREE.PlaneGeometry(1.8, 1.1), mats.fabricGreen)
-    flag.position.set(20, 10.2, -19)
-    group.add(flag)
-    // café terrace: real patio umbrellas (pole + conical canopy + base) with
-    // bistro tables — merged per material (5 draw calls for all 4 sets)
-    const umbrellaAccent = [mats.fabricOrange, mats.fabricRed, mats.fabricGreen, mats.fabricOrange]
-    const bistroPositions: [number, number][] = [
-      [18, -60],
-      [24, -70],
-      [38, -60],
-      [52, -70],
-    ]
-    {
-      const poleGeos: THREE.BufferGeometry[] = []
-      const baseGeos: THREE.BufferGeometry[] = []
-      const metalGeos: THREE.BufferGeometry[] = []
-      const woodGeos: THREE.BufferGeometry[] = []
-      const canopiesByMat = new Map<THREE.MeshStandardMaterial, THREE.BufferGeometry[]>()
-      bistroPositions.forEach(([mx, mz], ui) => {
-        const tilt = (ui % 2 === 0 ? 1 : -1) * 0.07
-        const pole = new THREE.CylinderGeometry(0.045, 0.06, 2.75, 8)
-        pole.translate(mx, 1.375, mz)
-        poleGeos.push(pole)
-        const base = new THREE.CylinderGeometry(0.3, 0.36, 0.09, 12)
-        base.translate(mx, 0.045, mz)
-        baseGeos.push(base)
-        // canopy: open cone tilted like a real umbrella, DoubleSide fabric
-        const canopyMat = umbrellaAccent[ui % umbrellaAccent.length]
-        canopyMat.side = THREE.DoubleSide
-        const canopy = new THREE.ConeGeometry(1.65, 0.55, 8, 1, true)
-        canopy.rotateZ(tilt)
-        canopy.rotateX(tilt * 0.6)
-        canopy.translate(mx, 2.9, mz)
-        if (!canopiesByMat.has(canopyMat)) canopiesByMat.set(canopyMat, [])
-        canopiesByMat.get(canopyMat)!.push(canopy)
-        for (let rib = 0; rib < 4; rib++) {
-          const angle = (rib / 4) * Math.PI * 2
-          const ribG = new THREE.BoxGeometry(0.03, 0.03, 1.6)
-          ribG.rotateX(0.32)
-          ribG.rotateY(angle)
-          ribG.translate(mx + Math.sin(angle) * 0.78, 2.78, mz + Math.cos(angle) * 0.78)
-          poleGeos.push(ribG)
-        }
-        const finial = new THREE.SphereGeometry(0.07, 8, 6)
-        finial.translate(mx + Math.sin(tilt) * 0.28, 3.2, mz)
-        metalGeos.push(finial)
-        const table = new THREE.CylinderGeometry(0.55, 0.55, 0.05, 12)
-        table.translate(mx, 0.78, mz)
-        metalGeos.push(table)
-        const tLeg = new THREE.CylinderGeometry(0.05, 0.09, 0.76, 8)
-        tLeg.translate(mx, 0.38, mz)
-        poleGeos.push(tLeg)
-        for (const so of [-0.95, 0.95]) {
-          const stool = new THREE.CylinderGeometry(0.22, 0.2, 0.06, 10)
-          stool.translate(mx + so, 0.62, mz)
-          woodGeos.push(stool)
-          const sLeg = new THREE.CylinderGeometry(0.035, 0.05, 0.6, 6)
-          sLeg.translate(mx + so, 0.3, mz)
-          poleGeos.push(sLeg)
-        }
-        colliders.push({ minX: mx - 0.6, maxX: mx + 0.6, minZ: mz - 0.6, maxZ: mz + 0.6, h: 0.85 })
-      })
-      addMerged(poleGeos, mats.metalDark)
-      addMerged(baseGeos, mats.concrete, false)
-      addMerged(metalGeos, mats.metal)
-      addMerged(woodGeos, mats.wood)
-      for (const [mat, geos] of canopiesByMat) {
-        const merged = mergeGeometries(geos, false)
-        if (!merged) continue
-        const mesh = new THREE.Mesh(merged, mat)
-        mesh.castShadow = true
-        mesh.receiveShadow = true
-        group.add(mesh)
-      }
-    }
-  }
+  // Civic Plaza is built by createCityCenter above.
 
   // ---- School sports pitches ----
   // Each school now gets a REAL 4-lane running track painted around its
@@ -1289,7 +1222,7 @@ export function createEnvironment(plan: CityPlan, mats: CityMaterials): Environm
     const m = new THREE.MeshStandardMaterial({ map: tex(c, false), roughness: 0.95 })
     return m
   })()
-  const pitchMarkMat = (() => {
+    const pitchMarkMat = (() => {
     const [c, ctx] = canvas(512, 320)
     ctx.strokeStyle = 'rgba(250,250,244,0.92)'
     ctx.lineWidth = 3
@@ -1313,12 +1246,12 @@ export function createEnvironment(plan: CityPlan, mats: CityMaterials): Environm
     return m
   })()
   for (const [sx, sz] of [[-252, -266], [252, -266], [-252, 338]]) {
-    const track = new THREE.Mesh(new THREE.PlaneGeometry(44, 32), trackMat)
+    const track = new THREE.Mesh(new THREE.PlaneGeometry(44, 32), decalMaterial(trackMat))
     track.rotation.x = -Math.PI / 2
     track.position.set(sx, 0.028, sz + 26)
     track.receiveShadow = true
     group.add(track)
-    const pitch = new THREE.Mesh(new THREE.PlaneGeometry(30, 18), getPitchMaterial())
+    const pitch = new THREE.Mesh(new THREE.PlaneGeometry(30, 18), decalMaterial(getPitchMaterial()))
     pitch.rotation.x = -Math.PI / 2
     pitch.position.set(sx, 0.05, sz + 26)
     pitch.receiveShadow = true
@@ -1327,7 +1260,7 @@ export function createEnvironment(plan: CityPlan, mats: CityMaterials): Environm
     marks.rotation.x = -Math.PI / 2
     marks.position.set(sx, 0.064, sz + 26)
     group.add(marks)
-    const court = new THREE.Mesh(worldUVPlane(new THREE.PlaneGeometry(12, 8), 12, 8, 6), mats.asphaltRough)
+    const court = new THREE.Mesh(worldUVPlane(new THREE.PlaneGeometry(12, 8), 12, 8, 6), decalMaterial(mats.asphaltRough))
     court.rotation.x = -Math.PI / 2
     court.position.set(sx - 28, 0.04, sz + 26)
     group.add(court)
@@ -1386,63 +1319,13 @@ export function createEnvironment(plan: CityPlan, mats: CityMaterials): Environm
     }
     const games = new THREE.Mesh(
       new THREE.CircleGeometry(7.6, 36),
-      new THREE.MeshStandardMaterial({ map: tex(pc, false), transparent: true, alphaTest: 0.25, roughness: 1 }),
+      decalMaterial(new THREE.MeshStandardMaterial({ map: tex(pc, false), transparent: true, alphaTest: 0.25, roughness: 1 })),
     )
     games.rotation.x = -Math.PI / 2
     games.position.set(-55, 0.064, -230)
     group.add(games)
 
-    // CIVIC PLAZA COMPASS MEDALLION at (50,-50): stone compass rose in the
-    // middle of the pavers — the plaza finally has a center
-    const [mc, mctx] = canvas(512, 512)
-    mctx.translate(256, 256)
-    // outer double ring
-    mctx.strokeStyle = '#8a867a'
-    mctx.lineWidth = 14
-    mctx.beginPath(); mctx.arc(0, 0, 238, 0, Math.PI * 2); mctx.stroke()
-    mctx.strokeStyle = '#a8a496'
-    mctx.lineWidth = 5
-    mctx.beginPath(); mctx.arc(0, 0, 214, 0, Math.PI * 2); mctx.stroke()
-    mctx.beginPath(); mctx.arc(0, 0, 178, 0, Math.PI * 2); mctx.stroke()
-    // compass star: proper 8-point polygon
-    mctx.beginPath()
-    for (let i = 0; i < 16; i++) {
-      const ang = (i / 16) * Math.PI * 2 - Math.PI / 2
-      const r = i % 2 === 0 ? 168 : 62
-      const wx = Math.cos(ang) * r
-      const wy = Math.sin(ang) * r
-      if (i === 0) mctx.moveTo(wx, wy)
-      else mctx.lineTo(wx, wy)
-    }
-    mctx.closePath()
-    mctx.fillStyle = '#8a867a'
-    mctx.fill()
-    mctx.strokeStyle = '#6a665c'
-    mctx.lineWidth = 4
-    mctx.stroke()
-    // center disc
-    mctx.beginPath()
-    mctx.arc(0, 0, 44, 0, Math.PI * 2)
-    mctx.fillStyle = '#b8b4a6'
-    mctx.fill()
-    mctx.strokeStyle = '#8a867a'
-    mctx.stroke()
-    // cardinal letters
-    mctx.fillStyle = '#5a564c'
-    mctx.font = 'bold 44px system-ui, sans-serif'
-    mctx.textAlign = 'center'
-    mctx.textBaseline = 'middle'
-    mctx.fillText('N', 0, -196)
-    mctx.fillText('S', 0, 196)
-    mctx.fillText('E', 196, 0)
-    mctx.fillText('W', -196, 0)
-    const medallion = new THREE.Mesh(
-      new THREE.CircleGeometry(6.5, 40),
-      new THREE.MeshStandardMaterial({ map: tex(mc, false), transparent: true, alphaTest: 0.25, roughness: 0.9 }),
-    )
-    medallion.rotation.x = -Math.PI / 2
-    medallion.position.set(50, 0.024, -50)
-    group.add(medallion)
+
   }
 
   /* ============================================================
@@ -2835,6 +2718,9 @@ export function createEnvironment(plan: CityPlan, mats: CityMaterials): Environm
   const animated = (t: number) => {
     for (const f of animators) f(t)
   }
+  const mobility = createMobilityInfrastructure(mats)
+  group.add(mobility.group)
+  colliders.push(...mobility.colliders)
   return { group, colliders, streetLights, puddleSpots, benchSpots, stopSpots, animated }
 }
 

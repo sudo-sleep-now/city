@@ -14,9 +14,9 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "SOLHEIM — A Walkable 3D Optimal City",
+  title: "SOLHEIM 2050 — City D Pilot District",
   description:
-    "A fully procedural, walkable first-person 3D city of ≈13,000 residents — built with Next.js, TypeScript and Three.js. A school project on optimal urban design.",
+    "A proposed pilot district for a car-dependent city: reliable buses, safer short trips and local services. Future Cities Summit 2050.",
   keywords: [
     "SOLHEIM",
     "Three.js",
@@ -29,9 +29,9 @@ export const metadata: Metadata = {
   ],
   authors: [{ name: "SOLHEIM Project" }],
   openGraph: {
-    title: "SOLHEIM — A Walkable 3D Optimal City",
+    title: "SOLHEIM 2050 — City D Pilot District",
     description:
-      "Explore a compact, transit-first city designed around short distances, mixed neighborhoods and streets that put people before cars.",
+      "Explore a proposed district retrofit for City D, with useful transport alternatives and fair access before restrictions.",
     type: "website",
   },
 };
